@@ -1,6 +1,8 @@
 # Architecture
 
-This document describes how the Split-Flap Universal Firmware is structured and why it is built the way it is. It is aimed at someone modifying the firmware or writing controller-side software against it. For the command reference and wiring, see `README.md`.
+This document describes how the Split-Flap Universal Firmware is structured and why it is built the way it is. It is aimed at someone modifying the firmware or writing controller-side software against it. For the command reference and wiring, see `README.md`; for the build/upload toolchain, see `SETUP.md`.
+
+> **Project format:** this is a **VSCode / PlatformIO** project. The firmware is a single C++ translation unit, `src/SplitFlapUniversalFirmware.cpp`, built per `platformio.ini` and uploaded over SerialUPDI. There is no longer an Arduino `.ino` sketch — PlatformIO's `.ino`→`.cpp` preprocessor mis-parses the single quotes in this firmware's comments, so the source is a plain `.cpp` that adds an explicit `#include <Arduino.h>` and a forward-declaration block (the work the Arduino auto-prototyper used to do implicitly).
 
 ## System context
 
@@ -27,19 +29,20 @@ The firmware is shaped by the constraints of the target and the deployment:
 
 ## Code layout
 
-The firmware is a single Arduino sketch. Reading top to bottom, it is organised as:
+The firmware is a single C++ file (`src/SplitFlapUniversalFirmware.cpp`). Reading top to bottom, it is organised as:
 
 1. **Header documentation** — message format, full command reference, EEPROM map, and the version changelog, all in comments.
-2. **`enum PendingReply`** — declared immediately after the includes. Its position matters: Arduino auto-generates function prototypes, and a function taking this enum as a parameter must see the type first. (This has been an easy thing to break.)
-3. **User configuration block** — pin assignments, mechanical constants, timing, and the watchdog timeout, fenced by clear `BEGIN`/`END` banners. This is the only region intended to be edited per-installation.
-4. **Globals and fixed-size buffers** — calibration values, current position, the parser accumulators, and the deferred-reply state.
-5. **Helper functions** — serial-number reading, supply-voltage measurement, EEPROM read/write/verify, ID formatting.
-6. **EEPROM persistence** — load on boot, save individual fields, dump and restore the whole configuration.
-7. **Provisioning** — advertisement, version response, factory reset, restore-from-payload.
-8. **Motor functions** — `applyStep`, `stepBackward`, `releaseMotor`, `hallActive`, `nudge`, `homeModule`, `calibrateModule`.
-9. **Diagnostics** — `hallSelfTest` (`T`), `reportDiagnostics` (`Q`), `mechanicalTest` (`M`).
-10. **Movement** — `moveToIndex`, `moveToChar`.
-11. **`setup()` and `loop()`** — boot sequence and the main parser/dispatch loop.
+2. **`#include <Arduino.h>`, `enum PendingReply`, and the forward-declaration block** — the explicit prototypes that let later code call functions defined further down. `PendingReply` is declared before any function that takes it as a parameter. (In the old `.ino` the Arduino auto-prototyper generated these; the `.cpp` lists them by hand.)
+3. **User configuration block** — pin assignments, mechanical constants (including `MAX_FLAPS`, the compile-time flap-count ceiling = 64), timing, and the watchdog timeout, fenced by clear `BEGIN`/`END` banners. This is the only region intended to be edited per-installation.
+4. **Flap character set** — the compile-time PROGMEM default set, plus the runtime `flapCount` / `flapCharsCustom` state and `flapCharAt()` (reads the configured set from EEPROM, or the default from PROGMEM).
+5. **Globals and fixed-size buffers** — calibration values, current position, the parser accumulators, and the deferred-reply state.
+6. **Helper functions** — serial-number reading, supply-voltage measurement, EEPROM read/write/verify, ID formatting; the RS-485 transmit helpers (`txBegin`/`txEnd`/`sendLine`/`txReplyHeader`/`txNumField`).
+7. **EEPROM persistence** — load on boot, save individual fields, the flap-set helpers (`loadFlapConfig`/`setFlapChars`/`applyFlapConfig`/`clearFlapMap`), dump and restore the whole configuration.
+8. **Provisioning** — advertisement, version response, factory reset, restore-from-payload.
+9. **Motor functions** — `applyStep`, `stepBackward`, `releaseMotor`, `hallActive`, `nudge`, `homeModule`, `calibrateModule`.
+10. **Diagnostics** — `hallSelfTest` (`T`), `reportDiagnostics` (`Q`), `mechanicalTest` (`M`).
+11. **Movement** — `gotoRawStep`, `moveToIndex`, `moveToChar`.
+12. **`setup()` and `loop()`** — boot sequence and the main parser/dispatch loop.
 
 ## Boot sequence
 
@@ -47,7 +50,7 @@ On reset, `setup()`:
 
 1. Captures the reset cause from `RSTCTRL.RSTFR` (so `Q` can later report *why* the module last reset) and increments a boot counter in EEPROM.
 2. Reads the ATtiny serial number from `SIGROW` and seeds the RNG from it.
-3. Loads configuration from EEPROM. The first byte is a magic value: `0x5D` is current; `0x5E` is a v8/v9-era layout that is loaded and then rewritten to `0x5D`; anything else is treated as a blank chip and initialised to defaults with module ID 255 (unprovisioned). Loaded calibration values are sanity-clamped.
+3. Loads configuration from EEPROM. The first byte is a magic value: `0x5D` is current; `0x5E` is a v8/v9-era layout that is loaded and then rewritten to `0x5D`; anything else is treated as a blank chip and initialised to defaults with module ID 255 (unprovisioned). Loaded calibration values are sanity-clamped. The configurable flap count and "is the character set custom?" flag are loaded here too (`loadFlapConfig`), falling back to the 64-flap default when never set.
 4. Waits a **staggered startup delay** so that a display full of modules powering on together does not all lurch at once (inrush). Provisioned modules use a delay derived from their ID; unprovisioned modules use a random delay seeded from their serial number.
 5. Enables the **2-second watchdog**.
 6. **Homes** (spin to the Hall sensor, then advance the stored offset to flap 0) or, if auto-home is disabled, restores the last saved step position from EEPROM.
@@ -96,12 +99,15 @@ Calibration and identity live in EEPROM so they survive power cycles and (with t
 | 0x0A | 1 | Boot counter (diagnostics) |
 | 0x0B | 1 | EEPROM health-check scratch byte |
 | 0x0C | 128 | Flap map: 64 × `uint16_t` calibrated positions, `0xFFFF` = uncalibrated |
+| 0x8C | 1 | Hall sensor active level (v30): `0`/`1`, `0xFF` = not yet auto-detected |
+| 0x8D | 1 | Flap count (v31): `1`–`64`, `0xFF`/out-of-range = default 64 |
+| 0x8E | 64 | Flap character set (v31): one byte per flap, `0xFF` in byte 0 = use the PROGMEM default |
 
-This layout has been stable since v6. The boot-counter and scratch bytes at `0x0A`/`0x0B` were reserved padding in the original layout and were put to use without moving any existing field. Only the magic byte has varied between firmware generations, and all known values are migrated automatically on first boot.
+This layout has been stable since v6. The boot-counter and scratch bytes at `0x0A`/`0x0B` were reserved padding in the original layout and were put to use without moving any existing field; the Hall-polarity byte (`0x8C`, v30) and the flap-set fields (`0x8D`–`0xCD`, v31) sit in the previously-unused tail past the flap map. Only the magic byte has varied between firmware generations, and all known values are migrated automatically on first boot. A field a module has never written reads back as `0xFF`/`0xFFFF` and falls back to its compile-time default, so modules flashed from older firmware degrade gracefully (e.g. a pre-v31 module simply uses the default 64-flap set until the `N` command configures it).
 
 EEPROM writes go through an `update`-style helper that reads first and only writes changed bytes, to spare the limited write-endurance of the cells. A small write-read-verify check (using the scratch byte) backs the `eepromOk` field in the `Q` diagnostics.
 
-> **Reflashing:** preserving EEPROM across a UPDI flash requires the `EESAVE` fuse to be set ("EEPROM retained" + Burn Bootloader once per chip). Without it, each flash erases calibration and identity, and the module reverts to unprovisioned with default calibration.
+> **Reflashing:** preserving EEPROM across a UPDI flash requires the `EESAVE` fuse to be set. With PlatformIO that means `board_hardware.eesave = yes` plus running `pio run -t fuses` once per chip (the equivalent of the Arduino IDE's *Burn Bootloader*). Without it, each flash erases calibration and identity, and the module reverts to unprovisioned with default calibration.
 
 ## Memory strategy
 
@@ -112,12 +118,14 @@ SRAM is the scarcest resource. Two deliberate choices keep it under control:
 
 The per-call stack cost of the diagnostics is bounded too — for example, the mechanical test's per-rotation array is sized to the maximum requestable rotation count and lives only on the stack during the test.
 
+**Flash is the binding constraint.** The build occupies roughly 99% of the ATtiny1616's 16 KB program flash, so new features have to be paid for by removing duplication elsewhere. The configurable flap set (v31), for instance, only fit after the repeated RS-485 transmit framing was factored into `txBegin`/`txEnd`/`sendLine`/`txReplyHeader`/`txNumField`, the dump assembly into `appendMsgId`/`appendFlapMap`, the flap-map erase into `clearFlapMap`, the `g` move into `gotoRawStep`, and the seven parameterless serial-number provisioning commands (`H`/`D`/`A`/`T`/`Q`/`M`/`F`) into a single shared parse state dispatched by a stored command letter. That is why the configured character set is read one byte at a time from EEPROM via `flapCharAt()` rather than mirrored into a RAM buffer — it saves both SRAM and the flash of the copy loops. `platformio.ini` also selects the minimal integer-only `printf` (`-lprintf_min`) with `-Os -flto`; switching to the full or float `printf` overflows flash. When adding code, build and watch the `Flash:` figure, and look for a repeated sequence to factor before assuming a feature won't fit.
+
 ## Motion model
 
 All movement is forward-only, in half-steps, through `stepBackward(n)` (the name is historical; it advances the reel). Each step pulses the watchdog, advances the half-step phase, and tracks the absolute step position, wrapping at one revolution. A Hall transition seen mid-move re-synchronises the absolute position to the known home location.
 
 - **Homing** spins until the Hall sensor trips, then advances the stored home offset to land on flap 0. If the sensor never trips within a bounded search, homing fails honestly and marks the position unknown (forcing a re-home on the next move) rather than pretending to be homed.
-- **Moving to a flap** computes the forward distance from the current position to the target (consulting the calibrated flap map where present) and steps it, homing first if the current position is unknown.
+- **Moving to a flap** computes the forward distance from the current position to the target (consulting the calibrated flap map where present, else an evenly-spaced estimate `index × totalSteps / flapCount`) and steps it, homing first if the current position is unknown. The valid index range is `0`–`flapCount−1`. Moving to a *character* (`-`) looks the byte up in the active flap set; a character not on the reel **homes** the module rather than doing nothing, giving a visible, predictable response.
 - **Nudging** fine-tunes the home offset; a negative nudge is realised as a forward move of nearly a full revolution to the equivalent position, with the stored offset wrapped accordingly.
 - **Calibration** measures the steps in one revolution by counting between Hall edges, sanity-checks the result, and stores it.
 
@@ -137,7 +145,7 @@ A central design point: the mechanical test's "did it move?" check drives a **fu
 
 When adding features, preserve the two compatibility contracts:
 
-- **Protocol:** add a new command letter, or append new fields to the *end* of an existing reply. Never move or repurpose an existing field's position — controllers parse by index. If a reply's last field is variable-length (like the flap map), think carefully before appending after it, because "the rest of the line" parsers will be affected.
-- **EEPROM:** add new fields after the existing layout (past the flap map), and treat an unwritten value (`0xFF` / `0xFFFF`) as "unknown" so modules flashed from older firmware degrade gracefully.
+- **Protocol:** add a new command letter, or append new fields to the *end* of an existing reply. Never move or repurpose an existing field's position — controllers parse by index. If a reply's last field is variable-length (like the flap map), think carefully before appending after it, because "the rest of the line" parsers will be affected. The v31 `A` dump shows the pattern: `:<flapCount>:<flapChars>` was appended *after* the variable-length map, and because the map contains no `:`, a controller can still locate the new fields by colon position while `<flapChars>` (which may contain `:`) is read as the final to-end-of-line field.
+- **EEPROM:** add new fields after the existing layout (past the flap-set fields at `0x8E`+), and treat an unwritten value (`0xFF` / `0xFFFF`) as "unknown" so modules flashed from older firmware degrade gracefully.
 
-Keep new wait-for-hardware loops bounded, pulse the watchdog inside any long motor move, and remember that the `PendingReply` enum must stay directly after the includes for the Arduino auto-prototyper. Verify changes compile and that braces balance before flashing.
+Keep new wait-for-hardware loops bounded, pulse the watchdog inside any long motor move, and keep `PendingReply` (and any type used in a function signature) declared before its first use — the `.cpp` relies on the explicit forward-declaration block near the top rather than auto-generated prototypes. Watch the `Flash:` figure (see *Memory strategy*): if a change overflows, factor a repeated sequence rather than dropping the feature. Verify changes compile (`pio run`) and that braces balance before flashing.

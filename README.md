@@ -22,7 +22,7 @@ Firmware for a multi-module split-flap display where each character cell is an i
   - [Diagnostic Commands](#diagnostic-commands)
   - [Provisioning Commands](#provisioning-commands)
   - [De-provisioning Command](#de-provisioning-command)
-- [Flap Character Map](#flap-character-map)
+- [Flap Character Set](#flap-character-set)
 - [Provisioning Script (`provision.py`)](#provisioning-script-provisionpy)
   - [Requirements](#requirements)
   - [Running the Script](#running-the-script)
@@ -37,24 +37,42 @@ Firmware for a multi-module split-flap display where each character cell is an i
 ## Repository Contents
 
 ```
-SplitFlapUniversalFirmware.ino  — ATtiny1616 firmware (Arduino sketch)
-provision.py                    — Raspberry Pi provisioning and management tool
-README.md                       — This file
+src/SplitFlapUniversalFirmware.cpp  — ATtiny1616 firmware (built with PlatformIO)
+platformio.ini                      — PlatformIO build/upload configuration
+.vscode/                            — VSCode + PlatformIO workspace settings
+provision.py                        — Raspberry Pi provisioning and management tool
+README.md                           — This file (command reference + protocol)
+SETUP.md                            — Step-by-step VSCode + PlatformIO install/build/upload guide
+ARCHITECTURE.md                     — How the firmware is structured and why
+RELEASE_NOTES.md                    — Per-version change history
 ```
+
+> **This is now a VSCode / PlatformIO project — there is no longer an Arduino `.ino` sketch.** The firmware lives in `src/SplitFlapUniversalFirmware.cpp` and is built/uploaded with PlatformIO. (PlatformIO's `.ino`→`.cpp` preprocessor mis-parses the single quotes in this firmware's comments, so the project uses a plain `.cpp` with an explicit `#include <Arduino.h>` and forward declarations.) The legacy Arduino IDE workflow is no longer supported.
 
 ---
 
 ## Flashing the Firmware
 
-The firmware is a standard Arduino sketch targeting the ATtiny1616 via the [megaTinyCore](https://github.com/SpenceKonde/megaTinyCore) board package.
+The firmware targets the ATtiny1616 via the [megaTinyCore](https://github.com/SpenceKonde/megaTinyCore) platform, built and uploaded with **[PlatformIO](https://platformio.org/)** inside **VSCode** (or via the `pio` CLI). Programming is over **SerialUPDI** (a cheap USB-serial adapter), not a dedicated programmer.
 
-1. Install **megaTinyCore** in the Arduino IDE via Boards Manager.
-2. Select **ATtiny1616** as the target board.
-3. Set the programmer to **jtag2updi** (or whichever UPDI programmer you are using).
-4. Set **Tools → Save EEPROM** to **"EEPROM retained"** and run **Burn Bootloader** once per chip. This sets the `EESAVE` fuse so that re-flashing preserves each module's ID and calibration (see [Upgrading Firmware](#upgrading-firmware)).
-5. Open `SplitFlapUniversalFirmware.ino` and click **Upload**.
+**New here? Follow the full walkthrough in [SETUP.md](SETUP.md)** — it covers installing VSCode, installing PlatformIO, getting the code, and building/uploading from scratch.
 
-Every module runs the same firmware binary. IDs are assigned at runtime via the provisioning tool — there is nothing to change before flashing.
+Quick version, once your toolchain is set up:
+
+1. Open this project folder in VSCode (PlatformIO auto-installs the ATtiny toolchain on first build).
+2. Wire the SerialUPDI adapter to the module's UPDI pin and **power the board separately** (the adapter does not power it). Set `upload_port` in [`platformio.ini`](platformio.ini) to your adapter.
+3. **Once per chip**, write the fuses so EEPROM is retained across reflashes:
+   ```bash
+   pio run -t fuses
+   ```
+   This sets the `EESAVE` fuse (and clock/BOD/UPDI fuses) — the PlatformIO equivalent of the Arduino IDE's *Burn Bootloader*. Without it, every flash wipes the module's ID and calibration (see [Upgrading Firmware](#upgrading-firmware)).
+4. Build and upload:
+   ```bash
+   pio run -t upload
+   ```
+   In VSCode you can instead click the PlatformIO **Build** (✓) and **Upload** (→) buttons in the status bar.
+
+Every module runs the same firmware binary. IDs and the flap set are assigned at runtime via the bus — there is nothing to change before flashing.
 
 ---
 
@@ -99,7 +117,7 @@ A 2-second hardware watchdog runs continuously after boot; if any operation hang
 
 ### EEPROM Layout
 
-The EEPROM field layout has been compatible since v6. Addresses `0x0A` and `0x0B` were reserved padding in the original layout and were put to use for diagnostics in v26 without disturbing any existing field or the flap map. Only the magic byte has varied across firmware versions; all known variants are recognised and migrated automatically on upgrade.
+The EEPROM field layout has been compatible since v6. Addresses `0x0A` and `0x0B` were reserved padding in the original layout and were put to use for diagnostics in v26 without disturbing any existing field or the flap map. The Hall-polarity byte (`0x8C`, v30) and the configurable flap-set fields (`0x8D`–`0xCD`, v31) live in the previously-unused tail, so **no v6-era field has ever moved**. Only the magic byte has varied across firmware versions; all known variants are recognised and migrated automatically on upgrade, and any field a module has never written reads back as `0xFF`/`0xFFFF` and falls back to its default.
 
 | Address | Size | Contents |
 |---|---|---|
@@ -113,6 +131,9 @@ The EEPROM field layout has been compatible since v6. Addresses `0x0A` and `0x0B
 | 0x0A | 1 byte | Boot counter (diagnostics; wraps at 255) |
 | 0x0B | 1 byte | EEPROM health-check scratch byte (diagnostics) |
 | 0x0C | 128 bytes | Calibrated step positions: 64 × `uint16_t`, `0xFFFF` = uncalibrated |
+| 0x8C | 1 byte | Hall sensor active level (v30): `0` = active-low, `1` = active-high, `0xFF` = not yet auto-detected |
+| 0x8D | 1 byte | **Flap count** (v31): active number of flaps, `1`–`64`; `0xFF`/out-of-range → default `64` |
+| 0x8E | 64 bytes | **Flap character set** (v31): one byte per flap; `0xFF` in the first byte → use the built-in default set |
 
 **Magic byte history** — all values are recognised and migrated to `0x5D` on first boot after upgrade:
 
@@ -171,20 +192,23 @@ m<ID>-<char>\n
 
 | Part | Description |
 |---|---|
-| `<char>` | Exactly one byte matching a character in the [flap character map](#flap-character-map) |
+| `<char>` | Exactly one byte matching a character in the [flap character set](#flap-character-set) |
+
+If the requested character is **not** in the module's flap set, the module simply **homes** the reel (since v31) rather than ignoring the command — a predictable, visible response to an unknown character.
 
 **Examples:**
 ```
 m38-B\n       → module 38 shows 'B'
 m5-7\n        → module 5 shows the character '7'
 m*- \n        → all modules show blank (space = flap 0)
+m38-Z\n       → if 'Z' is not on this reel, module 38 homes instead
 ```
 
 ---
 
 #### `+` — Show flap by index
 
-Move the reel to a specific flap by its zero-based numeric index (0–63).
+Move the reel to a specific flap by its zero-based numeric index (`0` to flap-count − 1, i.e. 0–63 by default).
 
 ```
 m<ID>+<index>\n
@@ -192,7 +216,7 @@ m<ID>+<index>\n
 
 | Part | Description |
 |---|---|
-| `<index>` | Integer 0–63 corresponding to a position in the flap character map |
+| `<index>` | Integer from `0` to the configured flap count − 1 (0–63 by default). An index ≥ the flap count is ignored. |
 
 **Examples:**
 ```
@@ -350,6 +374,37 @@ When auto-home is disabled the current step position and flap index are saved to
 
 ---
 
+#### `N` — Configure the flap set
+
+Sets the **number of physical flaps** and/or the **character set** on the reel, and persists them to EEPROM. Both parts are **optional and independent**, so you can set either one alone or both together. Both default to `64` and the built-in [flap character set](#flap-character-set).
+
+```
+m<ID>N<count>:<chars>\n
+```
+
+| Part | Description |
+|---|---|
+| `<count>` | Physical flap count, `1`–`64`. Drives the valid flap-index range and the step-position maths (`index × totalSteps / count`), so it must match the real reel. Out-of-range values are ignored. |
+| `<chars>` | The ordered character at each flap index (used by the `-` command). Up to 64 bytes, taken **verbatim** to end-of-line — it **may itself contain `:`**, so only the *first* colon separates `<count>` from `<chars>`. |
+
+Either side may be omitted:
+
+```
+m38N48\n                          → set flap count to 48 only (chars unchanged)
+m38N: ABCDEFGHIJ\n                → set the character set only (count unchanged)
+m38N10: 0123456789\n             → set both: 10 flaps showing digits 0–9
+m*N64: ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$&()-+=;q:%'.,/?*roygbpw\n
+                                  → reset every module on the bus to the default 64-flap set at once
+```
+
+There is **no reply**. The command works **direct-addressed**, as a **broadcast** (`m*N…`, to configure a whole panel in one shot), and **by serial number** (`mXN<sn>:<count>:<chars>` — see [Provisioning Commands](#provisioning-commands)). Read the current values back with the [`A` dump](#a--combined-all-fields-dump), which now reports them.
+
+> **Independence note:** count and character-set length are stored separately and a mismatch is tolerated. If the count exceeds the number of characters, the extra indices simply have no character to display via `-`; if the character set is longer than the count, the surplus characters are unreachable. For a normal reel, set them to the same value.
+
+> A factory reset (`F`) returns both the flap count and the character set to their defaults.
+
+---
+
 ### Diagnostic Commands
 
 #### `d` — Dump EEPROM
@@ -376,13 +431,15 @@ Returns **everything from `v` and `d` in a single message**, so a client can fet
 
 **Response format:**
 ```
-m<ID>A:<version>:<moduleId>:<serialNumber>:<homeOffset>:<totalSteps>:<autoHome>:<curIndex>:<idx>=<pos>,...\n
+m<ID>A:<version>:<moduleId>:<serialNumber>:<homeOffset>:<totalSteps>:<autoHome>:<curIndex>:<idx>=<pos>,...:<flapCount>:<flapChars>\n
 ```
 
 **Example response:**
 ```
-m38A:29:38:A3F24C0018E7D29B3F01:2832:4096:1:0:0=0,7=342\n
+m38A:31:38:A3F24C0018E7D29B3F01:2832:4096:1:0:0=0,7=342:64: ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$&()-+=;q:%'.,/?*roygbpw\n
 ```
+
+> **`<flapCount>` and `<flapChars>` were appended in v31.** They come *after* the variable-length flap map, so every field up to and including the map is byte-for-byte identical to the pre-v31 format and **older controllers keep working unchanged** (they just ignore the tail). `<flapChars>` is the **final** field and may itself contain `:`, `,` or `=`, so read it verbatim to end-of-line — do not split it further. This is exactly the tail that the [`mXW` restore](#serial-number-variants-of-other-commands) accepts, so an `A` dump round-trips back into a module.
 
 Direct-addressed `m<ID>A` and serial-number `mXA<sn>` forms reply synchronously. The broadcast form `m*A` **is** supported and staggered, with an optional ID range — but because each `A` frame is long (~570 ms), a full sweep is slow; prefer ranged batches on large buses:
 
@@ -405,7 +462,7 @@ m<ID>v:<version>:<moduleId>:<serialNumber>\n
 
 **Examples:**
 ```
-m38v\n        → m38v:29:38:A3F24C0018E7D29B3F01\n
+m38v\n        → m38v:31:38:A3F24C0018E7D29B3F01\n
 m*v\n         → every provisioned module replies in sequence, each in its own slot
 m*v0-49\n     → only IDs 0–49 reply (poll the bus in retryable batches)
 ```
@@ -602,21 +659,22 @@ Several commands have an `mX<letter><serialNumber>` form that targets a single m
 | `mXD<sn>` | Dump EEPROM config by serial number | Same as `d` |
 | `mXA<sn>` | Combined all-fields dump by serial number | Same as `A` |
 | `mXF<sn>` | Factory-reset EEPROM by serial number (preserves module ID) | None |
-| `mXW<sn>:<homeOffset>:<totalSteps>:<idx>=<pos>,...` | Restore a previously dumped EEPROM image (preserves module ID; map entries absent from the payload are cleared) | None |
+| `mXN<sn>:<count>:<chars>` | Configure the flap set by serial number (both parts optional; same semantics as the `N` command) | None |
+| `mXW<sn>:<homeOffset>:<totalSteps>:<idx>=<pos>,...[:<flapCount>:<flapChars>]` | Restore a previously dumped EEPROM image (preserves module ID; map entries absent from the payload are cleared; the optional flap-set tail is restored if present) | None |
 | `mXT<sn>` | Hall sensor self-test by serial number | Same as `T` |
 | `mXQ<sn>` | Diagnostics snapshot by serial number | Same as `Q` |
 | `mXM<sn>` | Mechanical self-test by serial number | Same as `M` |
 
-**Backup-and-restore example** — capture a module's calibration and push it back (e.g. after replacing a board):
+**Backup-and-restore example** — capture a module's complete state and push it back (e.g. after replacing a board). Using `A` (rather than `d`) captures the flap set as well, and the `mXW` restore accepts that same tail:
 
 ```
-mXDA3F24C0018E7D29B3F01\n
-→  m38d:2832:4096:0=0,7=342,12=683\n
+mXAA3F24C0018E7D29B3F01\n
+→  m38A:31:38:A3F24C0018E7D29B3F01:2832:4096:1:0:0=0,7=342:64: ABC…w\n
 
-mXWA3F24C0018E7D29B3F01:2832:4096:0=0,7=342,12=683\n
+mXWA3F24C0018E7D29B3F01:2832:4096:0=0,7=342:64: ABC…w\n
 ```
 
-The `mXW` payload format is identical to what `d` / `mXD` emit (minus the `m<id>d:` prefix), so a dumped configuration can be replayed directly.
+The `mXW` payload mirrors the calibration portion of the `d`/`A` dumps (home offset, total steps, flap map), optionally followed by the `:<flapCount>:<flapChars>` tail that `A` emits. If the tail is omitted, the flap set is left unchanged — so a `d`/`mXD` dump (which has no tail) still restores correctly.
 
 ---
 
@@ -641,9 +699,9 @@ m*R\n         → de-provision every module simultaneously
 
 ---
 
-## Flap Character Map
+## Flap Character Set
 
-The reel holds 64 physical flaps. Position 0 is always blank (the home position). The index in the string below corresponds to a physical flap on the reel.
+By default the reel holds 64 physical flaps. Position 0 is always blank (the home position). The index in the string below corresponds to a physical flap on the reel.
 
 ```
 " ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$&()-+=;q:%'.,/?*roygbpw"
@@ -659,6 +717,8 @@ The reel holds 64 physical flaps. Position 0 is always blank (the home position)
 | 57–63 | `r o y g b p w` (colour flaps) |
 
 The lowercase letters at the end (`r`, `o`, `y`, `g`, `b`, `p`, `w`) represent physical colour flaps. Address them by character with the `-` command — e.g. `m38-r\n` shows the red flap.
+
+> **This set is the compile-time default only.** Since v31 the flap count and character set are **configurable per module at runtime** via the [`N` command](#n--configure-the-flap-set) (and persisted in EEPROM), so a reel with a different number of flaps or a different character ordering is fully supported without recompiling. The string above is the fallback used by any module that has never been configured. The maximum is 64 flaps. The current set of any module can be read back from the [`A` dump](#a--combined-all-fields-dump).
 
 ---
 
@@ -784,33 +844,39 @@ Follow these steps when setting up a module for the first time or after a mechan
    ```
    Repeat with small values until the blank flap is centred.
 
-5. **Test character display:**
+5. **(Optional) Configure the flap set** — only if this reel differs from the default 64-flap layout. Set the count and/or character set (see the [`N` command](#n--configure-the-flap-set)):
+   ```
+   m38N10: 0123456789\n     → a 10-flap reel showing the digits 0–9
+   ```
+   Skip this step for standard 64-flap reels.
+
+6. **Test character display:**
    ```
    m38-A\n
    m38-0\n
    m38- \n     → back to blank
    ```
 
-6. **(Optional) Fine-calibrate individual flaps** — if specific characters land slightly off, drive to the exact step position manually and write it to the map:
+7. **(Optional) Fine-calibrate individual flaps** — if specific characters land slightly off, drive to the exact step position manually and write it to the map:
    ```
    m38g340\n         → manually drive to step 340
    m38w7:340\n       → save step 340 as the calibrated position for flap index 7
    ```
 
-7. **Verify the full map:**
+8. **Verify the full map:**
    ```
    m38d\n            → dump EEPROM config including all saved flap positions
    ```
 
-8. **Confirm firmware version and check hardware health:**
+9. **Confirm firmware version and check hardware health:**
    ```
-   m38v\n            → m38v:29:38:A3F24C0018E7D29B3F01\n
+   m38v\n            → m38v:31:38:A3F24C0018E7D29B3F01\n
    m38T\n            → Hall sensor self-test (expect code 0)
    m38M\n            → mechanical self-test (expect code 0, near-zero spread)
    m38Q\n            → diagnostics snapshot (check supply voltage, reset cause)
    ```
 
-   Alternatively, `m38A\n` returns the version, ID, serial number, and full calibration in a single message.
+   Alternatively, `m38A\n` returns the version, ID, serial number, full calibration, **and the configured flap set** in a single message.
 
 ---
 
@@ -840,7 +906,7 @@ When a module misbehaves, work through the self-tests in this order. Each isolat
 
 All firmware versions from v6 onward use the same EEPROM field layout. Flashing a newer firmware version onto an existing module will not erase calibration data or the module ID — **provided the `EESAVE` fuse is set** so that the chip erase performed before each UPDI flash preserves EEPROM.
 
-In the Arduino IDE with megaTinyCore: set **Tools → Save EEPROM** to **"EEPROM retained"** and run **Burn Bootloader** once per chip (a plain Upload does not write fuses). After that, every Upload preserves the module's ID and calibration. If this fuse is *not* set, each flash wipes EEPROM and the module reverts to unprovisioned with default calibration.
+With PlatformIO: run `pio run -t fuses` **once per chip** (the equivalent of the Arduino IDE's *Burn Bootloader*); this sets `EESAVE` via `board_hardware.eesave = yes` in [`platformio.ini`](platformio.ini). After that, every `pio run -t upload` preserves the module's ID, calibration, flap map, auto-detected Hall polarity, and configured flap set. If this fuse is *not* set, each flash wipes EEPROM and the module reverts to unprovisioned with default calibration. See [SETUP.md](SETUP.md) for the full toolchain walkthrough.
 
 | Previous version | Magic byte on chip | Behaviour on first boot of new firmware |
 |---|---|---|
@@ -848,4 +914,6 @@ In the Arduino IDE with megaTinyCore: set **Tools → Save EEPROM** to **"EEPROM
 | v8 or v9 | `0x5E` | Fields loaded, magic rewritten to `0x5D` |
 | Blank chip | `0xFF` | Full default init, ID set to 255 |
 
-> If a module ends up in an unexpected state after flashing, send `m<id>v\n` to confirm the firmware version and `m<id>d\n` (or `m<id>A\n` for everything at once) to inspect its EEPROM. Use `m<id>F\n` to reset calibration to defaults while keeping the ID, or `m<id>R\n` to fully de-provision the module. As a recovery path, keep periodic `mXD` dumps of each module so calibration can be restored with `mXW` if a chip is ever wiped or replaced.
+> **Upgrading to v31 from an earlier version:** the new flap-count and flap-character-set EEPROM fields (`0x8D`/`0x8E`) read back as `0xFF` on a module that predates them, so the module transparently falls back to the default 64-flap set until you configure it with the [`N` command](#n--configure-the-flap-set). No action is required for reels that use the standard 64-flap character set.
+
+> If a module ends up in an unexpected state after flashing, send `m<id>v\n` to confirm the firmware version and `m<id>d\n` (or `m<id>A\n` for everything at once, including the flap set) to inspect its EEPROM. Use `m<id>F\n` to reset calibration to defaults while keeping the ID, or `m<id>R\n` to fully de-provision the module. As a recovery path, keep periodic `mXA` dumps of each module so calibration **and the flap set** can be restored with `mXW` if a chip is ever wiped or replaced.
