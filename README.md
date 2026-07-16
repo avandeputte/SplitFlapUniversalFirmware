@@ -1,5 +1,11 @@
 # Split-Flap Display Firmware
 
+> ### 📖 [SplitFlap Wiki — the comprehensive documentation](https://github.com/avandeputte/SplitFlapGateway/wiki)
+> Quick start · choosing a configuration · provisioning & calibration · the SplitFlap and
+> Matrix Gateways · the companion and its apps · APIs and wire protocols — the whole
+> ecosystem, documented in one place.
+
+
 Firmware for a multi-module split-flap display where each character cell is an independent ATtiny1616 microcontroller connected to a shared RS-485 bus. A Raspberry Pi (or any serial host) sends commands over the bus to drive individual cells or the whole display at once.
 
 ---
