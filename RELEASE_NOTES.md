@@ -1,8 +1,34 @@
 # Release Notes
 
-Version history for the Split-Flap Universal Firmware. The firmware version is reported by the `v` and `A` commands (e.g. `m38v` → `m38v:31:38:<serial>`).
+Version history for the Split-Flap Universal Firmware. The firmware version is reported by the `v` and `A` commands (e.g. `m38v` → `m38v:32:38:<serial>`).
 
 All versions from v6 onward share the same EEPROM field layout, and every change to a reply has been **append-only** — new fields are added at the end so older controllers keep working. Upgrading preserves a module's ID and calibration **as long as the `EESAVE` fuse is set** (see [SETUP.md](SETUP.md) § "Write the fuses").
+
+---
+
+## v32 — Brown-out protection and receive-path hardening
+
+No wire-format or EEPROM-layout change. This release addresses modules that "forgot" their settings after a power cycle, and several ways a busy module could commit a truncated frame to EEPROM.
+
+**Fuse change — action required on every module**
+- The **brown-out detector is now enabled at 2.6 V** (`board_hardware.bod = 2.6v`, fuse `0x54`). It was previously disabled, which at 10 MHz (datasheet minimum 2.7 V) let the CPU execute during the part of every power-up and power-down ramp where flash and EEPROM reads are unreliable — the textbook cause of AVR EEPROM corruption. **Run `pio run -t fuses` once on each module** (before or after the upload; it does not erase EEPROM). A brown-out reset now shows as `0x02` in the `Q` reset cause.
+
+**Receive path**
+- **RX overflow guard.** SoftwareSerial drops bytes once its ring is full while the firmware is inside a long move or EEPROM burst. The parser now detects that, finishes the intact frames already buffered, abandons the one frame that was cut, and skips its spliced tail — instead of writing a truncated character set or flap map to EEPROM, or acting on a display frame assembled from two different frames.
+- **Receive buffer raised to 128 bytes** (`-D_SS_MAX_RX_BUFF=128`), so every `N` flap-set frame (up to 91 bytes) fits even on a busy module.
+- **Catch-all 200 ms idle timeout** for every parser state, so a lone `m` from bus noise or a lost terminator can never leave the parser waiting to swallow the next frame.
+- **Deferred broadcast replies and advertisements wait for an idle parser**, and the advertisement no longer discards unread receive bytes — an unprovisioned replacement board can no longer eat the middle of its own `mXW` restore.
+- **`RESTORE_MAX` 600 → 640** (a full 64-entry map plus 64-char set is ~579 bytes; the old limit left 21 bytes of headroom and truncated silently).
+
+**EEPROM**
+- **Every EEPROM write pulses the watchdog.** A full restore or factory reset on a calibrated module is ~300 back-to-back writes, close enough to the 2 s watchdog that a reset mid-restore (map cleared, half rewritten) was a real risk.
+- **Saved step position fixed.** It was written as a 4-byte `long` into the 2-byte field at `0x07`, spilling over the saved index and boot counter, and read back with those bytes included — so restore-on-boot (auto-home off) always clamped to 0.
+- **Magic byte written last** when initialising a blank chip, so a power loss midway leaves "not initialised" rather than a valid magic over `0xFF` fields.
+- **Calibration sanity clamp shared by boot and `mXW` restore**, so a garbled payload can never persist a zero-length revolution; a mapped flap position outside the revolution falls back to even spacing instead of driving up to 16 turns.
+- **`Q` health check is now two write cycles, run on the first `Q` after boot and then at most hourly** with the result cached — a controller polling `Q` every minute would previously have worn the scratch cell out in weeks.
+
+**Internal**
+- The motion primitive is `advance()` (formerly `stepBackward`; the name was historical — the reel only ever moves forward) and the three revolution-measurement paths (first boot, `c`, `M`) share one `measureOneRev()`. These v31-era refactors had not been pushed to GitHub before; no behaviour change.
 
 ---
 

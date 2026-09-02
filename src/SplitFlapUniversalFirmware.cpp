@@ -1,5 +1,5 @@
 // ==============================================================================
-// Split-Flap Universal Firmware — v31
+// Split-Flap Universal Firmware — v32
 // ==============================================================================
 // Each module controls one character cell driven by a 28BYJ-48 stepper motor.
 // A Hall effect sensor detects a magnet on the reel to find the home position.
@@ -189,6 +189,26 @@
 // ==============================================================================
 // CHANGE LOG
 // ==============================================================================
+//   v32 — Robustness release: no wire-format or EEPROM-layout change.
+//         - Brown-out detector now ENABLED at 2.6 V (fuse; re-run "fuses" once
+//           per module).  BOD off at 10 MHz let the CPU run out of spec on every
+//           power ramp, the classic cause of EEPROM corruption/misreads.
+//         - RX overflow guard: a frame whose tail was dropped while the module
+//           was busy is abandoned and its spliced remainder skipped, instead of
+//           being committed to EEPROM as a truncated char set / flap map (or
+//           acted on as a mis-addressed display frame).  128-byte RX buffer.
+//         - Catch-all 200 ms idle timeout for every parser state; deferred
+//           broadcast replies and advertisements wait for an idle parser; the
+//           advertisement no longer discards unread RX bytes.
+//         - Every EEPROM write pulses the watchdog (full restore ≈ 300 writes).
+//         - Saved step position written/read as the 2-byte field it is (it was
+//           a 4-byte long spilling over the saved index and boot counter, so
+//           restore-on-boot never worked); magic byte written LAST on a blank
+//           chip; calibration clamp shared by boot and restore; an out-of-range
+//           mapped flap position falls back to even spacing.
+//         - 'Q' EEPROM health check is two writes, run on the first Q after
+//           boot then at most hourly (cached) — safe to poll.
+//         - RESTORE_MAX 600 → 640.
 //   v31 — The flap count and character set are now configurable at runtime via
 //         the new 'N' command (m<id>N<count>:<chars>), independently of each
 //         other and persisted in EEPROM; both default to the previous 64 /
@@ -347,6 +367,7 @@ void eepromUpdateByte(int addr, uint8_t value);
 void saveHomeOffset();
 void saveTotalSteps();
 void saveHallActive();
+void clampCalibration();
 void saveState();
 char flapCharAt(int i);
 void loadFlapConfig();
@@ -366,12 +387,13 @@ void sendVersionResponse();
 void resetEepromDefaults();
 void restoreEepromFromPayload(const char *payload);
 void applyStep(const uint8_t *step);
-void stepBackward(int steps);
+void advance(int steps);
 void releaseMotor();
 bool hallActive();
 bool detectHallPolarity();
 void nudge(int n);
 bool homeModule();
+static long measureOneRev(long offBound, long edgeBound, unsigned offDelay, long *magnetWidth);
 int measureStepCount();
 void calibrateModule();
 void hallSelfTest();
@@ -391,7 +413,7 @@ void gotoRawStep(long target);
 
 // ── Firmware version ──────────────────────────────────────────────────────────
 // Returned by the 'v', 'A', and mXA commands.  Bump when you change behaviour.
-const char FIRMWARE_VERSION[] = "31";
+const char FIRMWARE_VERSION[] = "32";
 
 // ── Pin assignments ───────────────────────────────────────────────────────────
 // RS-485 transceiver
@@ -444,6 +466,14 @@ const unsigned long CSMA_LISTEN_MS = 20UL;
 // motor moves call wdt_reset() internally, so this only needs to cover a normal
 // loop iteration with margin.
 #define WDT_TIMEOUT WDTO_2S
+
+// ── EEPROM health-check cadence ───────────────────────────────────────────────
+// The 'Q' diagnostics include a write-read-verify of the scratch cell.  Each
+// check costs two EEPROM write cycles on that cell (rated ~100k), so it is run
+// on the first 'Q' after boot and then at most once per this interval; between
+// checks 'Q' reports the cached result.  A controller polling 'Q' every minute
+// would otherwise wear the cell out in weeks.  Hourly = ~6 years of cell life.
+const unsigned long EE_HEALTH_INTERVAL_MS = 3600000UL;
 
 // ── Mechanical self-test ('M') ────────────────────────────────────────────────
 // Number of revolutions sampled to assess steps-per-rev consistency.  More revs
@@ -626,17 +656,26 @@ uint16_t readVccMillivolts() {
 }
 
 // EEPROM write-read-verify health check on a dedicated scratch byte.
-// Writes a known pattern, reads it back, restores the previous value.
-// Returns true if the cell read back correctly.
+// Inverts the cell (every bit toggles one way), verifies, restores it (every
+// bit toggles back), verifies again: two write cycles instead of the previous
+// three.  Rate-limited (EE_HEALTH_INTERVAL_MS) with the result cached, so a
+// controller polling 'Q' cannot wear the cell out; the first call after boot
+// always runs the real check.  Returns true if both reads matched.
+static bool          eeHealthCached = true;
+static unsigned long eeHealthDue    = 0;     // 0 → check on the first call
 bool eepromHealthOk() {
-  uint8_t saved = EEPROM.read(ADDR_EE_SCRATCH);
-  const uint8_t pattern = 0xA5;
-  EEPROM.write(ADDR_EE_SCRATCH, pattern);
-  bool ok1 = (EEPROM.read(ADDR_EE_SCRATCH) == pattern);
-  EEPROM.write(ADDR_EE_SCRATCH, (uint8_t)~pattern);
-  bool ok2 = (EEPROM.read(ADDR_EE_SCRATCH) == (uint8_t)~pattern);
+  if ((long)(millis() - eeHealthDue) < 0) return eeHealthCached;
+  eeHealthDue = millis() + EE_HEALTH_INTERVAL_MS;
+
+  uint8_t saved   = EEPROM.read(ADDR_EE_SCRATCH);
+  uint8_t flipped = (uint8_t)~saved;
+  wdt_reset();
+  EEPROM.write(ADDR_EE_SCRATCH, flipped);
+  bool ok = (EEPROM.read(ADDR_EE_SCRATCH) == flipped);
   EEPROM.write(ADDR_EE_SCRATCH, saved);    // restore
-  return ok1 && ok2;
+  ok = ok && (EEPROM.read(ADDR_EE_SCRATCH) == saved);
+  eeHealthCached = ok;
+  return ok;
 }
 
 
@@ -700,21 +739,25 @@ int  tempIndex        = -1;
 //   idBuffer       : up to 3 ID digits
 //   buffer         : numeric payloads (step counts up to ~5 digits) + a little slack
 //   snBuffer       : exactly 20 serial-number hex chars
-//   restorePayload : <homeOffset>:<totalSteps>:<map> — bounded by MAX_FLAPS entries
+//   restorePayload : <homeOffset>:<totalSteps>:<map>[:<count>:<chars>] — a full
+//                    64-entry map with 4-digit positions plus a 64-char set is
+//                    ~579 bytes, so 640 leaves real headroom (600 left only 21)
 // Each buffer carries its own length and a helper to append a char safely; once
 // full, further chars are dropped (the frame will be rejected/timed out cleanly).
 #define IDBUF_MAX   4
 #define NUMBUF_MAX  8
 #define SNBUF_MAX   20
-#define RESTORE_MAX 600
+#define RESTORE_MAX 640
 
 // ── Shared large work buffer ──────────────────────────────────────────────────
 // One buffer serves BOTH the incoming mXW restore payload AND the outgoing d/A
 // dump assembly.  These never overlap in time: a restore payload is consumed
 // the instant its terminator arrives (parse state 17), and the dump commands
-// run in unrelated parser states — a module is never receiving a restore while
-// transmitting a dump.  Sharing one buffer instead of two saves ~600 bytes of
-// the ATtiny1616's 2 KB SRAM.  Sized to the larger of the two needs.
+// run in unrelated parser states.  The one way they COULD collide — a deferred
+// broadcast 'A' reply firing from loop() while a restore is still streaming in
+// — is closed by loop() only sending deferred replies while the parser is idle
+// (parseState == 0).  Sharing one buffer instead of two saves ~600 bytes of the
+// ATtiny1616's 2 KB SRAM.  Sized to the larger of the two needs.
 #define DUMP_BUF_SIZE 720   // also holds the +flapCount/flapChars 'A' tail (v31)
 #if (RESTORE_MAX + 1) > DUMP_BUF_SIZE
   #error "WORK_BUF too small for restore payload"
@@ -807,10 +850,27 @@ unsigned long nextAdvertiseTime = 0;
 unsigned long suppressAdvUntil  = 0;   // advertisements paused until this time (after seeing m*)
 
 bool   snColonSeen = false;
+// Set by the RX overflow guard in loop() once the last byte received BEFORE a
+// ring-buffer overflow has been consumed: what follows is the tail of some
+// frame spliced onto the gap, so bytes are dropped until the next terminator
+// (or 200 ms idle) instead of being parsed into a field and written to EEPROM.
+bool   rxDiscard   = false;
+// Bytes still to consume from BEFORE an overflow gap (see the guard in loop());
+// 0 = no overflow pending.  Consuming the last of them arms rxDiscard.
+uint8_t rxCut      = 0;
 // The command letter of a serial-number-addressed provisioning command whose
 // action takes no parameters (H/D/A/T/Q/M/F).  All seven share one parse state
 // (collect SN → run action) to save flash; provCmd selects the action.
 char   provCmd     = 0;
+
+// Abandon whatever frame is in progress: clear every accumulator and return to
+// state 0.  Shared by the RX overflow guard and the catch-all idle timeout.
+void resetParser() {
+  bufClear(idBuf, idLen); bufClear(numBuf, numLen); bufClear(snBuf, snLen);
+  restoreLen = 0; restoreBuf[0] = '\0';
+  snColonSeen = false; idWildcard = false; idProvision = false;
+  parseState = 0;
+}
 
 const uint8_t halfStepSequence[8][4] = {
   {1,0,0,0}, {1,1,0,0}, {0,1,0,0}, {0,1,1,0},
@@ -822,7 +882,12 @@ const uint8_t halfStepSequence[8][4] = {
 // ==========================================
 // Write a byte only if it differs from what's already stored, to avoid wearing
 // out EEPROM cells (rated ~100k writes) on values that haven't changed.
+// Every write also pulses the watchdog: a full mXW restore or factory reset on
+// a fully-calibrated module is ~300 byte writes back-to-back (a few ms each),
+// which is uncomfortably close to the 2 s WDT — a reset mid-restore would leave
+// the map cleared and half rewritten.  wdt_reset() is a single instruction.
 void eepromUpdateByte(int addr, uint8_t value) {
+  wdt_reset();
   if (EEPROM.read(addr) != value) EEPROM.write(addr, value);
 }
 
@@ -837,6 +902,15 @@ void eepromUpdate(int addr, const T &value) {
 void saveHomeOffset() { eepromUpdate(ADDR_HOME_OFFSET, stepsFromHallToZero); }
 void saveTotalSteps()  { eepromUpdate(ADDR_TOTAL_STEPS, totalStepsPerRev); }
 void saveHallActive()  { eepromUpdateByte(ADDR_HALL_ACTIVE, hallActiveLevel == HIGH ? 1 : 0); }
+
+// Sanity-clamp the two calibration scalars so a corrupted EEPROM cell — or a
+// garbled/spliced mXW payload — can't produce absurd step counts or a zero-length
+// revolution that stalls every move.  Shared by boot and the restore path.
+void clampCalibration() {
+  if (totalStepsPerRev < 500 || totalStepsPerRev > 8000) totalStepsPerRev = 4096;
+  if (stepsFromHallToZero < 0 || stepsFromHallToZero > totalStepsPerRev)
+    stepsFromHallToZero = 2832;
+}
 
 // ── Flap-set configuration ('N' command) helpers ──────────────────────────────
 // Persist the configured char set to EEPROM: the first `len` bytes (clamped to
@@ -886,9 +960,15 @@ void clearFlapMap() {
   }
 }
 
+// The saved position field is 2 bytes (0x07-0x08; see the EEPROM layout).
+// currentStepPos is a long, so it is narrowed to int16_t here — writing the long
+// directly spilled its upper two bytes over the saved index (0x09) and the boot
+// counter (0x0A), and reading it back pulled those bytes into the position so
+// the restore-on-boot clamp rejected it every time.
 void saveState() {
   if (!autoHomeEnabled) {
-    eepromUpdate(ADDR_SAVED_POS,   currentStepPos);
+    int16_t pos = (int16_t)currentStepPos;
+    eepromUpdate(ADDR_SAVED_POS,   pos);
     eepromUpdateByte(ADDR_SAVED_INDEX, (uint8_t)(int8_t)currentFlapIndex);
   }
 }
@@ -909,6 +989,10 @@ void txEnd() {
   delay(2);                        // hold DE until the final stop bit is on the wire
   digitalWrite(RS485_DE, LOW);
   while (rs485.available()) rs485.read();   // discard self-echo
+  // If the ring overflowed while the handler now replying was busy (or loop()
+  // was still consuming pre-gap bytes), that drain just threw away the head of
+  // a cut frame — so skip its spliced tail up to the next terminator.
+  if (rs485.overflow() || rxCut) { rxCut = 0; rxDiscard = true; }
 }
 void sendLine(const char *s) {
   txBegin();
@@ -1003,7 +1087,6 @@ void dumpEeprom() {
 
   // ── Transmit the assembled line in one burst ─────────────────────────
   sendLine(buf);
-  parseState = 0;
 }
 
 // ==========================================
@@ -1069,7 +1152,6 @@ void dumpAll() {
 
   // ── Transmit in one burst ────────────────────────────────────────────
   sendLine(buf);
-  parseState = 0;
 }
 
 // ==========================================
@@ -1081,7 +1163,10 @@ void scheduleNextAdvertisement() {
 
 // Carrier-sense then transmit.  Returns true if sent, false if bus was busy.
 bool sendAdvertisement() {
-  while (rs485.available()) rs485.read();   // drain stale bytes
+  // Never discard unread bytes here: anything in the RX buffer is the head of a
+  // frame loop() has not parsed yet (possibly a restore addressed to THIS
+  // module).  Unread bytes simply mean the bus is busy — defer.
+  if (rs485.available()) return false;
 
   unsigned long listenEnd = millis() + CSMA_LISTEN_MS;
   while (millis() < listenEnd) {
@@ -1123,7 +1208,6 @@ void sendVersionResponse() {
   rs485.print(serialStr);
   rs485.print("\n");
   txEnd();
-  parseState = 0;
 }
 
 // ==========================================
@@ -1154,8 +1238,8 @@ void resetEepromDefaults() {
   eepromUpdateByte(ADDR_AUTO_HOME, 1);
 
   // Clear saved position
-  long   zeroPosL = 0;
-  eepromUpdate(ADDR_SAVED_POS, zeroPosL);
+  int16_t zeroPos = 0;                      // 2-byte field (see saveState)
+  eepromUpdate(ADDR_SAVED_POS, zeroPos);
   eepromUpdateByte(ADDR_SAVED_INDEX, 0);
 
   // Erase the entire calibrated flap map
@@ -1208,6 +1292,7 @@ void restoreEepromFromPayload(const char *payload) {
 
   stepsFromHallToZero = (int)ho;
   totalStepsPerRev    = (int)ts;
+  clampCalibration();      // never persist an absurd value from a bad payload
   saveHomeOffset();
   saveTotalSteps();
 
@@ -1256,7 +1341,15 @@ void applyStep(const uint8_t *step) {
   digitalWrite(IN3, step[2]); digitalWrite(IN4, step[3]);
 }
 
-void stepBackward(int steps) {
+// Advance the reel by `steps` half-steps.  This is the firmware's ONLY motion
+// primitive: the reel is mechanically one-way (flaps only fall in one
+// direction), so every move — homing, nudging, going to a flap — is some number
+// of forward half-steps.  The half-step phase is walked in its reverse order
+// (`--currentPhase`) because that is the coil sequence that turns THIS reel
+// forward; the reel's motion, not the phase direction, is what the name means.
+// (This was historically named stepBackward.)  Each step pulses the watchdog,
+// re-syncs the absolute position on a Hall edge, and wraps at one revolution.
+void advance(int steps) {
   static bool lastHallState = false;
   for (int k = 0; k < steps; k++) {
     wdt_reset();   // keep the watchdog happy during long moves
@@ -1301,7 +1394,7 @@ bool detectHallPolarity() {
   for (long i = 0; i < (long)totalStepsPerRev; i++) {
     if (digitalRead(HALL_PIN) == LOW) lowSamples++;
     else                              highSamples++;
-    stepBackward(1);
+    advance(1);
   }
   releaseMotor();
 
@@ -1336,7 +1429,7 @@ void nudge(int n) {
   // Physical move: convert any signed nudge into an equivalent forward count.
   long fwd = n % totalStepsPerRev;
   if (fwd < 0) fwd += totalStepsPerRev;
-  for (long k = 0; k < fwd; k++) stepBackward(1);
+  for (long k = 0; k < fwd; k++) advance(1);
   releaseMotor();
 
   // Calibration: adjust the stored home offset by the signed amount, wrapped
@@ -1351,7 +1444,7 @@ void nudge(int n) {
 // ==========================================
 //           LOGIC FUNCTIONS
 // ==========================================
-// Drive backward until the Hall sensor edge is found, then advance the home
+// Advance the reel until the Hall sensor edge is found, then advance the home
 // offset to land on flap 0.  If the Hall edge is NEVER found within the safety
 // window (stuck/failed sensor, missing magnet), do NOT claim a known position:
 // leave currentFlapIndex = -1 so the next move re-attempts homing instead of
@@ -1361,7 +1454,7 @@ bool homeModule() {
   bool foundHome = false;
   while (safety < (totalStepsPerRev + 500)) {
     if (hallActive()) { foundHome = true; break; }
-    stepBackward(1); safety++;
+    advance(1); safety++;
   }
 
   if (!foundHome) {
@@ -1370,7 +1463,7 @@ bool homeModule() {
     return false;
   }
 
-  stepBackward(stepsFromHallToZero);
+  advance(stepsFromHallToZero);
   currentStepPos = 0; currentFlapIndex = 0;
   releaseMotor();
   return true;
@@ -1379,21 +1472,15 @@ bool homeModule() {
 // Measures steps-per-revolution once and returns it, or 0 if the measurement is
 // invalid (no magnet seen / stuck sensor).  Self-contained and side-effect-free
 // apart from moving the motor — it does NOT save anything.  Used by the
-// first-boot auto-measure path; calibrateModule has its own inline measurement
-// plus the RS-485 reply.  Assumes hall polarity is already correct.
+// first-boot auto-measure path.  Shares the revolution-measurement routine with
+// calibrateModule and the mechanical test (measureOneRev); this path uses the
+// generous fixed safety bounds (4000 / totalStepsPerRev+1000) and no settle
+// delay, releases the motor, and validates the result.  Assumes hall polarity
+// is already correct.
 int measureStepCount() {
-  long safety = 0;
-  while (hallActive() && safety < 4000) { stepBackward(1); safety++; }
-  safety = 0;
-  while (!hallActive() && safety < (totalStepsPerRev + 1000)) { stepBackward(1); safety++; }
-  safety = 0;
-  while (hallActive() && safety < 2000) { stepBackward(1); safety++; }
-  int measured = 0;
-  while (!hallActive() && measured < (totalStepsPerRev * 2 + 1000)) { stepBackward(1); measured++; }
-  safety = 0;
-  while (hallActive() && safety < 2000) { stepBackward(1); measured++; safety++; }
+  long measured = measureOneRev(4000, totalStepsPerRev + 1000, 0, nullptr);
   releaseMotor();
-  return (measured > 500 && measured < 8000) ? measured : 0;
+  return (measured > 500 && measured < 8000) ? (int)measured : 0;
 }
 
 void calibrateModule() {
@@ -1406,25 +1493,11 @@ void calibrateModule() {
     saveHallActive();
   }
 
-  long safety = 0;
-  // Move off the magnet if currently on it (bounded).
-  while (hallActive() && safety < 4000) { stepBackward(1); safety++; delay(5); }
-
-  // Find the first magnet edge (bounded).
-  safety = 0;
-  while (!hallActive() && safety < (totalStepsPerRev + 1000)) { stepBackward(1); safety++; }
-
-  // Step through the magnet region (bounded — previously unbounded → could hang).
-  safety = 0;
-  while (hallActive() && safety < 2000) { stepBackward(1); safety++; }
-
-  // Measure one full revolution: count steps until we return through the magnet.
-  int measuredSteps = 0;
-  while (!hallActive() && measuredSteps < (totalStepsPerRev * 2 + 1000)) {
-    stepBackward(1); measuredSteps++;
-  }
-  safety = 0;
-  while (hallActive() && safety < 2000) { stepBackward(1); measuredSteps++; safety++; }
+  // Measure one revolution using the shared routine.  Same safety bounds as the
+  // first-boot path, plus a 5 ms per-step settle on the initial move-off-magnet
+  // (calibrate is operator-triggered and not time-critical).  The motor is left
+  // energised through the reply and re-homed below, so we do NOT release here.
+  long measuredSteps = measureOneRev(4000, totalStepsPerRev + 1000, 5, nullptr);
 
   // Sanity-check the measurement before committing it.  A wildly wrong value
   // (stuck sensor, no magnet) is rejected so we don't poison the calibration.
@@ -1440,7 +1513,7 @@ void calibrateModule() {
   txEnd();
 
   if (valid) {
-    totalStepsPerRev = measuredSteps;
+    totalStepsPerRev = (int)measuredSteps;
     saveTotalSteps();
   }
   homeModule();
@@ -1482,7 +1555,7 @@ void hallSelfTest() {
   // Bounded so a stuck-active sensor can't spin here forever.
   long runIn = 0;
   long runInMax = (long)totalStepsPerRev + (totalStepsPerRev / 10);
-  while (hallActive() && runIn < runInMax) { stepBackward(1); runIn++; }
+  while (hallActive() && runIn < runInMax) { advance(1); runIn++; }
   // (If the sensor is stuck active, runIn saturates and we start anyway; the
   //  classification below still flags it correctly as STUCK_ACTIVE.)
 
@@ -1493,7 +1566,7 @@ void hallSelfTest() {
   if (prevActive) activeSamples++;
 
   for (long i = 0; i < (long)totalStepsPerRev; i++) {
-    stepBackward(1);
+    advance(1);
     bool now = hallActive();
     if (now) activeSamples++;
     if ( now && !prevActive) risingEdges++;   // inactive → active
@@ -1553,7 +1626,6 @@ void hallSelfTest() {
   // Leave the module in a known state.
   homeModule();
   saveState();
-  parseState = 0;
 }
 
 // ==========================================
@@ -1566,6 +1638,8 @@ void hallSelfTest() {
 //     bootCount   boots since the counter was last reset (wraps at 255)
 //     vcc_mV      measured supply voltage in millivolts (0 if unavailable)
 //     eepromOk    1 = EEPROM scratch cell write-read-verify passed, else 0
+//                 (run on the first 'Q' after boot, then re-tested at most once
+//                 per EE_HEALTH_INTERVAL_MS; cached in between to spare the cell)
 //     curIndex    current flap index (-1 = unknown / needs homing)
 // A controller can watch for: a non-zero watchdog/brown-out reset bit, a VCC
 // sagging below ~4.5 V under load, eepromOk == 0, or a climbing bootCount that
@@ -1582,7 +1656,6 @@ void reportDiagnostics() {
   txNumField(currentFlapIndex);
   rs485.print("\n");
   txEnd();
-  parseState = 0;
 }
 
 // ==========================================
@@ -1612,29 +1685,40 @@ void reportDiagnostics() {
 //
 // Returns the module re-homed afterward.
 
-// Measures one full revolution (return value = steps per rev).  Also reports the
-// width of the magnet's active region via the out-parameter magnetWidth, which
-// the mechanical test averages — a per-revolution sensor-gap signal that no
-// single-shot measurement can reveal (a wobbling shaft or loosening magnet makes
-// this vary across revolutions).  Pass nullptr if the width isn't needed.
-static long measureOneRev(long *magnetWidth = nullptr) {
-  // From somewhere off the magnet, step until the magnet edge, counting steps
-  // for one full revolution back to the next edge.  Bounded for safety.
+// The single revolution-measurement routine, shared by measureStepCount (first
+// boot), calibrateModule (the 'c' command), and the mechanical self-test.  From
+// anywhere on the reel it steps off the magnet, finds the first edge, then
+// counts one full revolution back through the magnet, returning the raw step
+// count.  It does NOT validate the result or release the motor — the caller
+// decides what is in range and whether to release/home.
+//
+// Parameters keep each caller's exact behaviour while sharing one body:
+//   offBound    safety cap on the initial move-off-magnet loop
+//   edgeBound   safety cap on the advance-to-first-edge loop
+//   offDelay    per-step delay (ms) during move-off-magnet; calibrate uses 5 ms
+//               to settle, the measurement paths use 0
+//   magnetWidth if non-null, receives the magnet's active-region width (the
+//               mechanical test averages this as a sensor-gap signal — a
+//               wobbling shaft or loosening magnet makes it vary across revs)
+// The magnet-pass and full-revolution phases use fixed bounds common to all
+// callers.
+static long measureOneRev(long offBound, long edgeBound,
+                          unsigned offDelay, long *magnetWidth) {
   long safety = 0;
-  // ensure we start off-magnet
-  while (hallActive() && safety < (totalStepsPerRev + 500)) { stepBackward(1); safety++; }
+  // ensure we start off-magnet (optionally slowed for mechanical settling)
+  while (hallActive() && safety < offBound) { advance(1); safety++; if (offDelay) delay(offDelay); }
   // advance to the first edge
   safety = 0;
-  while (!hallActive() && safety < (totalStepsPerRev + 500)) { stepBackward(1); safety++; }
+  while (!hallActive() && safety < edgeBound) { advance(1); safety++; }
   // step through the magnet region — this loop count IS the magnet's active width
   long width = 0;
-  while (hallActive() && width < 2000) { stepBackward(1); width++; }
+  while (hallActive() && width < 2000) { advance(1); width++; }
   if (magnetWidth) *magnetWidth = width;
   // count a full revolution until we return through the magnet
   long count = 0;
-  while (!hallActive() && count < (totalStepsPerRev * 2 + 1000)) { stepBackward(1); count++; }
+  while (!hallActive() && count < (totalStepsPerRev * 2 + 1000)) { advance(1); count++; }
   long s2 = 0;
-  while (hallActive() && s2 < 2000) { stepBackward(1); count++; s2++; }
+  while (hallActive() && s2 < 2000) { advance(1); count++; s2++; }
   return count;
 }
 
@@ -1665,7 +1749,7 @@ void mechanicalTest(int requestedRevs) {
   if (startState) gateActive++;
   long gateSpan = (long)totalStepsPerRev + (totalStepsPerRev / 10);
   for (long i = 0; i < gateSpan; i++) {
-    stepBackward(1);
+    advance(1);
     if (hallActive()) { sawActive = true; gateActive++; }
     else                sawInactive = true;
   }
@@ -1690,7 +1774,7 @@ void mechanicalTest(int requestedRevs) {
     long widthSum = 0;
     for (int r = 0; r < nReq; r++) {
       long width = 0;
-      long m = measureOneRev(&width);
+      long m = measureOneRev(totalStepsPerRev + 500, totalStepsPerRev + 500, 0, &width);
       revs[r] = m;
       widthSum += width;
       if (r == 0) { mn = mx = m; }
@@ -1749,7 +1833,6 @@ void mechanicalTest(int requestedRevs) {
 
   homeModule();
   saveState();
-  parseState = 0;
 }
 
 // 'g' command: step forward to absolute raw step position `target`, then mark
@@ -1757,7 +1840,7 @@ void mechanicalTest(int requestedRevs) {
 void gotoRawStep(long target) {
   long move = target - currentStepPos;
   if (move < 0) move += totalStepsPerRev;
-  while (move-- > 0) stepBackward(1);
+  while (move-- > 0) advance(1);
   releaseMotor(); currentFlapIndex = -2; saveState();
 }
 
@@ -1774,13 +1857,16 @@ void moveToIndex(int targetIndex) {
   uint16_t mappedPos = 0xFFFF;
   EEPROM.get(ADDR_MAP_START + (targetIndex * 2), mappedPos);
 
-  long targetStepPos = (mappedPos != 0xFFFF)
+  // A stored position must lie inside the revolution; 0xFFFF (uncalibrated) or
+  // a garbage value from a bad restore falls back to the evenly-spaced default
+  // rather than driving up to 16 revolutions to a meaningless raw step.
+  long targetStepPos = ((long)mappedPos < (long)totalStepsPerRev)
     ? (long)mappedPos
     : ((long)targetIndex * (long)totalStepsPerRev) / flapCount;
 
   long stepsToMove = targetStepPos - currentStepPos;
   if (stepsToMove < 0) stepsToMove += totalStepsPerRev;
-  while (stepsToMove-- > 0) stepBackward(1);
+  while (stepsToMove-- > 0) advance(1);
 
   releaseMotor();
   currentFlapIndex = targetIndex;
@@ -1849,7 +1935,9 @@ void setup() {
   } else {
     // Blank chip or unrecognised magic — write defaults.
     // Module ID intentionally left as 255 (unprovisioned).
-    eepromUpdateByte(ADDR_INIT, EEPROM_MAGIC);
+    // The magic byte is written LAST: if power drops midway, the next boot sees
+    // "not initialised" and redoes this, rather than trusting half-written
+    // fields (0xFF auto-home would silently disable homing, for instance).
     saveHomeOffset();
     saveTotalSteps();
     eepromUpdateByte(ADDR_MODULE_ID, 255);
@@ -1864,6 +1952,7 @@ void setup() {
     // the compile-time defaults until the operator configures it via 'N'.
     eepromUpdateByte(ADDR_FLAP_COUNT, 0xFF);
     eepromUpdateByte(ADDR_FLAP_CHARS, 0xFF);
+    eepromUpdateByte(ADDR_INIT, EEPROM_MAGIC);   // commit: everything above is in place
   }
 
   // Load the configurable flap count + char set (defaults when never set).
@@ -1873,9 +1962,7 @@ void setup() {
 
   // Sanity-clamp calibration values loaded from EEPROM so a corrupted cell can't
   // produce absurd step counts / divide-by-something-silly later.
-  if (totalStepsPerRev < 500 || totalStepsPerRev > 8000) totalStepsPerRev = 4096;
-  if (stepsFromHallToZero < 0 || stepsFromHallToZero > totalStepsPerRev)
-    stepsFromHallToZero = 2832;
+  clampCalibration();
 
   // ── Staggered startup ─────────────────────────────────────────────────────
   // Spread motor inrush so a whole panel powering on together doesn't brown out.
@@ -1932,7 +2019,9 @@ void setup() {
     homeModule();
     saveState();
   } else {
-    EEPROM.get(ADDR_SAVED_POS, currentStepPos);
+    int16_t savedPos;
+    EEPROM.get(ADDR_SAVED_POS, savedPos);     // 2-byte field (see saveState)
+    currentStepPos = savedPos;
     if (currentStepPos < 0 || currentStepPos >= (long)totalStepsPerRev) currentStepPos = 0;
     currentFlapIndex = (int8_t)EEPROM.read(ADDR_SAVED_INDEX);
     if (currentFlapIndex < -1 || currentFlapIndex >= flapCount) currentFlapIndex = -1;
@@ -1978,10 +2067,16 @@ void setup() {
 void loop() {
   wdt_reset();   // service the watchdog every iteration
 
-  // ── Deferred reply (broadcast m*v only) ──────────────────────────────────
-  // Only broadcast version replies are deferred (to stagger across modules).
-  // Direct v/d and mXD reply synchronously in the parser.
-  if (pendingReply != REPLY_NONE && (long)(millis() - pendingReplyTime) >= 0) {
+  // ── Deferred reply (broadcast m*v / m*A only) ────────────────────────────
+  // Only broadcast replies are deferred (to stagger across modules).  Direct
+  // v/d/A and the mX forms reply synchronously in the parser.
+  // Only fires while the parser is IDLE: a slot that lands mid-frame would (a)
+  // transmit on top of a frame already on the bus, (b) lose the rest of that
+  // frame (RX is off during our TX), and (c) for an 'A' reply, overwrite the
+  // shared work buffer under a restore payload.  A frame in progress is over
+  // in a few ms (a restore in ~650 ms), so the reply is merely delayed.
+  if (pendingReply != REPLY_NONE && parseState == 0 &&
+      (long)(millis() - pendingReplyTime) >= 0) {
     if      (pendingReply == REPLY_VERSION) sendVersionResponse();
     else if (pendingReply == REPLY_ALL)     dumpAll();
     pendingReply = REPLY_NONE;
@@ -1990,7 +2085,9 @@ void loop() {
   // ── Advertisement heartbeat (unprovisioned only) ──────────────────────────
   // Suppressed for a short window after any m* broadcast so an advertisement
   // can't collide with an in-progress m*v reply sweep.
-  if (moduleId == 255 &&
+  // Also gated on an idle parser: an unprovisioned (replacement) board being
+  // restored by serial number must not interrupt the ~650 ms payload to talk.
+  if (moduleId == 255 && parseState == 0 &&
       (long)(millis() - nextAdvertiseTime) >= 0 &&
       (long)(millis() - suppressAdvUntil) >= 0) {
     sendAdvertisement();       // CSMA inside; silently drops if bus busy
@@ -1999,8 +2096,34 @@ void loop() {
 
   // ── Incoming serial ───────────────────────────────────────────────────────
   while (rs485.available()) {
+    // ── RX overflow guard ────────────────────────────────────────────────
+    // overflow() reports (and clears) that the ring filled and bytes were
+    // DROPPED while we were busy — a multi-second move or an EEPROM burst,
+    // which is usually the handler of the PREVIOUS byte, hence a per-byte
+    // check.  At that moment the ring is still full and everything in it
+    // arrived BEFORE the gap: complete frames at the head, then the head of
+    // the one frame that was cut.  Parse those normally, but once the last
+    // pre-gap byte is consumed abandon any frame still open (its tail is gone)
+    // and drop what follows up to the next terminator — it is the tail of some
+    // other frame spliced onto the gap.  Without this a busy module could
+    // commit a truncated char set or flap map to EEPROM, or act on a
+    // mis-addressed display frame ("m1" + "3-C" from two different frames).
+    // A second overflow while the first is still being consumed is rare
+    // enough to handle bluntly: drop the lot and resync on the next terminator.
+    if (rs485.overflow()) {
+      if (rxCut == 0) rxCut = (uint8_t)rs485.available();
+      else { while (rs485.available()) rs485.read();
+             rxCut = 0; resetParser(); rxDiscard = true; break; }
+    }
     char c = rs485.read();
     lastSerialTime = millis();
+    bool cut = (rxCut && --rxCut == 0);    // c is the last byte before the gap
+
+    if (rxDiscard) {                       // skipping a spliced tail
+      if (c == '\n' || c == '\r') rxDiscard = false;
+      if (cut) rxDiscard = true;           // ...but the gap follows: keep skipping
+      continue;
+    }
 
     switch (parseState) {
 
@@ -2428,6 +2551,10 @@ void loop() {
         break;
 
     }  // end switch(parseState)
+
+    // Last pre-gap byte consumed (see the overflow guard above): whatever frame
+    // is still open lost its tail — abandon it and skip the spliced remainder.
+    if (cut) { resetParser(); rxDiscard = true; }
   }  // end while(rs485.available())
 
   // ── Timeout: flush incomplete numeric commands (50 ms idle) ───────────────
@@ -2494,5 +2621,15 @@ void loop() {
     }
     schedulePendingReply(broadcastReplyType, true);
     bufClear(numBuf, numLen); snColonSeen = false; parseState = 0;
+  }
+
+  // ── Timeout: catch-all — reset ANY parser state left idle for 200 ms ──────
+  // The handlers above cover the states that APPLY something on idle.  This
+  // one covers the rest (1: address, 4: display char) and the overflow-discard
+  // mode, so a lone 'm' from bus noise or a lost terminator can never leave the
+  // parser waiting to swallow the NEXT frame's bytes into the current field.
+  if ((parseState != 0 || rxDiscard) && (millis() - lastSerialTime > 200)) {
+    rxDiscard = false;
+    resetParser();
   }
 }  // end loop()

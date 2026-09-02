@@ -133,7 +133,9 @@ upload_port  = /dev/cu.usbserial-XXXX    ; macOS example
 
 > If you omit `upload_port`, PlatformIO will try to auto-detect a single connected adapter, which often works when only one is plugged in.
 
-The rest of `platformio.ini` is already configured for this board (ATtiny1616, 10 MHz internal clock, EEPROM-retain fuse, SerialUPDI at 57600 baud, minimal-`printf` size flags). You normally don't need to change anything else.
+The rest of `platformio.ini` is already configured for this board (ATtiny1616, 10 MHz internal clock, EEPROM-retain fuse, SerialUPDI at 57600 baud, minimal-`printf` size flags, and a 128-byte SoftwareSerial receive buffer via `-D_SS_MAX_RX_BUFF=128`). You normally don't need to change anything else.
+
+> The receive-buffer flag must be applied to the SoftwareSerial *library* build, which `build_flags` does. If you build with the Arduino IDE instead, edit `_SS_MAX_RX_BUFF` in the core's `SoftwareSerial.h`; a `#define` in the sketch does not reach the library.
 
 ---
 
@@ -165,6 +167,8 @@ Before the **first** upload to a given chip, write its fuses. This configures th
 
 You only need to do this **once per physical chip**. After that, every upload keeps EEPROM intact.
 
+> **Brown-out detector.** The fuses step now also enables BOD at 2.6 V (`board_hardware.bod = 2.6v`). With BOD off, the ATtiny1616 at 10 MHz executes during the part of every power-up and power-down ramp where it is below its 2.7 V minimum, and EEPROM can be misread or corrupted there. If a module's fuses were written with an older `platformio.ini`, **run the fuses step again once** — it does not erase EEPROM. After the change, a brown-out reset is reported as `0x02` in the `Q` diagnostics reset cause, so a sagging supply becomes visible instead of silently corrupting data.
+
 > Skipping this means every upload **erases** the module's EEPROM, so it forgets its bus ID, calibration, and configured flap set and reverts to an unprovisioned default state.
 
 ---
@@ -190,7 +194,7 @@ Every module runs the **same** binary — there is nothing to change per-module 
 Once flashed and connected to your RS-485 bus, you can confirm the version over the bus (see [README.md](README.md) for the full protocol and the `provision.py` tool):
 
 ```
-m<ID>v\n      → m<ID>v:31:<ID>:<serialNumber>\n
+m<ID>v\n      → m<ID>v:32:<ID>:<serialNumber>\n
 ```
 
 A freshly flashed, never-provisioned module advertises its serial number every ~10–15 seconds and has bus ID 255 until you provision it.

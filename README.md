@@ -72,6 +72,8 @@ Quick version, once your toolchain is set up:
    pio run -t fuses
    ```
    This sets the `EESAVE` fuse (and clock/BOD/UPDI fuses) — the PlatformIO equivalent of the Arduino IDE's *Burn Bootloader*. Without it, every flash wipes the module's ID and calibration (see [Upgrading Firmware](#upgrading-firmware)).
+
+   The same step enables the **brown-out detector at 2.6 V**. Earlier configurations left BOD disabled, which at 10 MHz let the chip run out of spec during every power ramp and could corrupt or misread EEPROM — the cause of modules "forgetting" their settings after a power cycle. **Modules whose fuses were written before this change need the fuses step run once more.** Writing fuses does not erase EEPROM, so IDs and calibration survive.
 4. Build and upload:
    ```bash
    pio run -t upload
@@ -442,7 +444,7 @@ m<ID>A:<version>:<moduleId>:<serialNumber>:<homeOffset>:<totalSteps>:<autoHome>:
 
 **Example response:**
 ```
-m38A:31:38:A3F24C0018E7D29B3F01:2832:4096:1:0:0=0,7=342:64: ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$&()-+=;q:%'.,/?*roygbpw\n
+m38A:32:38:A3F24C0018E7D29B3F01:2832:4096:1:0:0=0,7=342:64: ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$&()-+=;q:%'.,/?*roygbpw\n
 ```
 
 > **`<flapCount>` and `<flapChars>` were appended in v31.** They come *after* the variable-length flap map, so every field up to and including the map is byte-for-byte identical to the pre-v31 format and **older controllers keep working unchanged** (they just ignore the tail). `<flapChars>` is the **final** field and may itself contain `:`, `,` or `=`, so read it verbatim to end-of-line — do not split it further. This is exactly the tail that the [`mXW` restore](#serial-number-variants-of-other-commands) accepts, so an `A` dump round-trips back into a module.
@@ -468,7 +470,7 @@ m<ID>v:<version>:<moduleId>:<serialNumber>\n
 
 **Examples:**
 ```
-m38v\n        → m38v:31:38:A3F24C0018E7D29B3F01\n
+m38v\n        → m38v:32:38:A3F24C0018E7D29B3F01\n
 m*v\n         → every provisioned module replies in sequence, each in its own slot
 m*v0-49\n     → only IDs 0–49 reply (poll the bus in retryable batches)
 ```
@@ -543,7 +545,7 @@ m<ID>Q:<resetCause>:<bootCount>:<vcc_mV>:<eepromOk>:<curIndex>\n
 | `resetCause` | Raw reset-flag bits from the last reset: `0x01` power-on, `0x02` brown-out, `0x04` external, `0x08` watchdog, `0x10` software |
 | `bootCount` | Boots since the counter was last cleared (wraps at 255) — a climbing value indicates a module silently resetting in the field |
 | `vcc_mV` | Measured supply voltage in millivolts |
-| `eepromOk` | `1` if the EEPROM write-read-verify check passed, else `0` |
+| `eepromOk` | `1` if the EEPROM write-read-verify check passed, else `0`. The check itself (two write cycles on a scratch cell) runs on the first `Q` after boot and then at most once per hour; polls in between return the cached result, so `Q` is safe to poll frequently |
 | `curIndex` | Current flap index (`-1` = position unknown / needs homing) |
 
 **Example response:**
@@ -675,7 +677,7 @@ Several commands have an `mX<letter><serialNumber>` form that targets a single m
 
 ```
 mXAA3F24C0018E7D29B3F01\n
-→  m38A:31:38:A3F24C0018E7D29B3F01:2832:4096:1:0:0=0,7=342:64: ABC…w\n
+→  m38A:32:38:A3F24C0018E7D29B3F01:2832:4096:1:0:0=0,7=342:64: ABC…w\n
 
 mXWA3F24C0018E7D29B3F01:2832:4096:0=0,7=342:64: ABC…w\n
 ```
@@ -876,7 +878,7 @@ Follow these steps when setting up a module for the first time or after a mechan
 
 9. **Confirm firmware version and check hardware health:**
    ```
-   m38v\n            → m38v:31:38:A3F24C0018E7D29B3F01\n
+   m38v\n            → m38v:32:38:A3F24C0018E7D29B3F01\n
    m38T\n            → Hall sensor self-test (expect code 0)
    m38M\n            → mechanical self-test (expect code 0, near-zero spread)
    m38Q\n            → diagnostics snapshot (check supply voltage, reset cause)
@@ -919,6 +921,8 @@ With PlatformIO: run `pio run -t fuses` **once per chip** (the equivalent of the
 | v6 or later | `0x5D` | Loaded as-is — no migration needed |
 | v8 or v9 | `0x5E` | Fields loaded, magic rewritten to `0x5D` |
 | Blank chip | `0xFF` | Full default init, ID set to 255 |
+
+> **Upgrading to v32:** the fuses now enable the brown-out detector, so **run `pio run -t fuses` once on every module** in addition to the upload (see [SETUP.md](SETUP.md)). Fuse writes do not erase EEPROM. Nothing else changes: same commands, same replies, same EEPROM layout.
 
 > **Upgrading to v31 from an earlier version:** the new flap-count and flap-character-set EEPROM fields (`0x8D`/`0x8E`) read back as `0xFF` on a module that predates them, so the module transparently falls back to the default 64-flap set until you configure it with the [`N` command](#n--configure-the-flap-set). No action is required for reels that use the standard 64-flap character set.
 
