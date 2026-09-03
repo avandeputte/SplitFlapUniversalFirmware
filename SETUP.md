@@ -1,5 +1,7 @@
 # Setup Guide — Build & Flash the Firmware (VSCode + PlatformIO)
 
+> **Only want to flash a release?** You do not need any of this. [FLASHING.md](FLASHING.md) flashes the prebuilt `firmware.hex` with avrdude alone, and [FLASHER.md](FLASHER.md) shows the programmer hardware. This guide is for building the firmware from source.
+
 This is a step-by-step walkthrough for someone starting from nothing: install VSCode, install PlatformIO, get the code, and build and upload the firmware to an ATtiny1616 module.
 
 > **This project is VSCode / PlatformIO only — there is no Arduino `.ino` sketch.** The firmware is `src/SplitFlapUniversalFirmware.cpp`, built per `platformio.ini`. The old Arduino IDE workflow is no longer supported.

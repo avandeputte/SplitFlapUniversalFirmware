@@ -98,7 +98,7 @@ pio run -t fuses
 pio run -t upload
 ```
 
-See [SETUP.md](SETUP.md) for the full toolchain walkthrough.
+See [SETUP.md](SETUP.md) for the full toolchain walkthrough. No PlatformIO? [FLASHING.md](FLASHING.md) does the same two steps with avrdude alone and the prebuilt `firmware.hex` from the latest release.
 
 ### If it says `UPDI link initialization failed`
 

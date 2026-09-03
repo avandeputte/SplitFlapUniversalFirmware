@@ -61,7 +61,7 @@ RELEASE_NOTES.md                    — Per-version change history
 
 The firmware targets the ATtiny1616 via the [megaTinyCore](https://github.com/SpenceKonde/megaTinyCore) platform, built and uploaded with **[PlatformIO](https://platformio.org/)** inside **VSCode** (or via the `pio` CLI). Programming is over **SerialUPDI** (a cheap USB-serial adapter), not a dedicated programmer.
 
-**New here? Follow the full walkthrough in [SETUP.md](SETUP.md)** — it covers installing VSCode, installing PlatformIO, getting the code, and building/uploading from scratch. **Need a programmer? [FLASHER.md](FLASHER.md)** shows how to turn a CH340 USB-to-serial adapter into a SerialUPDI flasher with one diode.
+**New here? Follow the full walkthrough in [SETUP.md](SETUP.md)** — it covers installing VSCode, installing PlatformIO, getting the code, and building/uploading from scratch. **Need a programmer? [FLASHER.md](FLASHER.md)** shows how to turn a CH340 USB-to-serial adapter into a SerialUPDI flasher with one diode. **Just want to flash a release, no compiler? [FLASHING.md](FLASHING.md)** does it with avrdude and the `firmware.hex` attached to every release.
 
 Quick version, once your toolchain is set up:
 
