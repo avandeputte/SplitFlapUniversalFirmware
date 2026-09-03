@@ -37,10 +37,8 @@ For *what the firmware does* and the command protocol, see [README.md](README.md
 
 **Hardware**
 - An ATtiny1616-based split-flap module (or a bare ATtiny1616).
-- A **SerialUPDI** programmer — a cheap USB-to-serial (UART) adapter (CP2102, CH340, FT232, etc.) wired for UPDI. A single resistor (typically 470 Ω – 1 kΩ) between the adapter's TX and RX forms the UPDI data line; that line connects to the chip's **UPDI** pin.
-- A way to **power the module** during programming. **The SerialUPDI adapter does not power the board** — provide the module's normal supply (and common ground with the adapter).
-
-> If you have never wired a SerialUPDI adapter, search "SerialUPDI megaTinyCore wiring" for the standard TX—(resistor)—RX → UPDI arrangement. megaTinyCore's documentation has a detailed page on it.
+- A **SerialUPDI** programmer — a cheap CH340 USB-to-serial adapter with one Schottky diode soldered between its `TXD` and `RXD` pins. **[FLASHER.md](FLASHER.md) shows how to build one** (parts, photos, and why the diode's band must face `TXD`).
+- **Three jumper wires** from the adapter to the module's `UPDI Interface` header: `3V3`, `GND` and the UPDI line. The adapter powers the module's controller over the `3V3` wire while flashing.
 
 ---
 
