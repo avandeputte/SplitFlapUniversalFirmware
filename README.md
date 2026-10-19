@@ -21,6 +21,7 @@ Firmware for a multi-module split-flap display where each character cell is an i
 - [RS-485 Message Protocol](#rs-485-message-protocol)
   - [Message Format](#message-format)
   - [Addressing](#addressing)
+  - [Checksums (optional, v33+)](#checksums-optional-v33)
 - [Command Reference](#command-reference)
   - [Display Commands](#display-commands)
   - [Calibration Commands](#calibration-commands)
@@ -180,7 +181,43 @@ The firmware accepts all address formats that have ever been used across all ver
 | Star with ID range | `m*v0-49` | Broadcast to a sub-range of IDs (see `v` / `A` below) |
 | Literal `X` | `mX` | Provisioning address — all modules respond regardless of ID |
 
-Broadcast replies are **staggered**: each responding module waits for a time slot indexed by its ID before transmitting, so replies arrive as a clean sequence rather than colliding. The slot width depends on the reply size (see the `v` and `A` commands). Long, motor-driven commands and multi-line replies (`d`, `A`, `c`, `T`, `Q`, `M`) are **direct-addressed only** — they cannot be staggered across a broadcast and ignore the `*` wildcard.
+Broadcast replies are **staggered**: each responding module waits for a time slot indexed by its ID before transmitting, so replies arrive as a clean sequence rather than colliding. The slot width depends on the reply size, and since v33 a module also waits for a quiet bus before using its slot (see the `v` and `A` commands). Long, motor-driven commands and multi-line replies (`d`, `A`, `c`, `T`, `Q`, `M`) are **direct-addressed only** — they cannot be staggered across a broadcast and ignore the `*` wildcard.
+
+### Checksums (optional, v33+)
+
+Any message can be sent with a checksum in front of it. A module checks it before acting on the message, and answers with a checksum of its own.
+
+```
+~  HHHH  m <ADDR> <CMD> [data]  \n
+│    │
+│    └── CRC-16 of the message, as 4 hex digits
+└─────── '~' introduces the checksum
+```
+
+**The checksum.** `HHHH` is the CRC-16/CCITT-FALSE of the message itself: every byte from the `m` up to, but not including, the terminator, written as four hex digits (either case).
+- Parameters: polynomial `0x1021`, initial value `0xFFFF`, no reflection, no final XOR.
+- Check value: `123456789` gives `29B1`.
+- In Python: `binascii.crc_hqx(message, 0xFFFF)`.
+
+```
+~C500m05v\n        →  ~5E12m05v:33:5:A3F24C0018E7D29B3F01\n
+~4895m05o2832\n    →  (no reply, as for any o command)
+```
+
+**What a module does with it:**
+- **It checks first.** A checksummed frame is collected whole, up to its terminator, and its checksum is checked before anything in it is acted on.
+- **A match runs normally.** The message runs exactly as the same message sent plain would.
+- **Replies are checksummed too.** Every reply the message causes carries a checksum in the same form, computed over the reply from its `m` to, but not including, its `\n`. A staggered broadcast reply (`m*v`, `m*A`) is checksummed if its broadcast was.
+- **A mismatch is dropped silently**, as is a malformed checksum or a frame too long for the buffer. If the frame was for this module (its ID, a broadcast, or `X`), it is counted in the `Q` field `crcErrors`.
+- **Plain messages are unaffected.** A message without a checksum is handled and answered exactly as before. Advertisements are always plain.
+
+**Rules and limits:**
+- **Always send the terminator.** A checksummed frame that comes without one is still checked after 50 ms of silence. But if another frame follows it before that silence (for example, both queued while the module was busy turning), the module can't tell where the first one ends, and both are lost.
+- **One command per checksummed frame.**
+- **The checksum costs 5 bytes per message,** so more bytes pile up at a busy module during a full-wall update.
+- **The overflow skip doesn't apply.** A checksummed frame is never discarded by the skip that follows a receive overflow, because a spliced frame can't pass its check.
+- **If the `~` itself is lost on the wire,** what remains reads as a plain message and is acted on unchecked. A single error there leaves the message itself intact, but the module then answers plain. A controller that sent a checksum should therefore treat a plain reply from a v33+ module as a failed exchange.
+- **Older firmware (v32 and earlier) ignores the checksum.** It skips everything before the `m`, runs the message unchecked, and answers plain. Checksums can therefore be used on a mixed wall, broadcasts included.
 
 ---
 
@@ -224,7 +261,7 @@ m<ID>+<index>\n
 
 | Part | Description |
 |---|---|
-| `<index>` | Integer from `0` to the configured flap count − 1 (0–63 by default). An index ≥ the flap count is ignored. |
+| `<index>` | Integer from `0` to the configured flap count − 1 (0–63 by default). An index ≥ the flap count is ignored, and so (since v33) is a `+` with no index at all; it used to move to flap 0. |
 
 **Examples:**
 ```
@@ -337,6 +374,8 @@ m<ID>w<index>:<stepPosition>\n
 m38w7:342\n   → flap index 7 is at step 342
 ```
 
+The index must be below the configured flap count, and the position must be a real step on the reel: `0` to total steps − 1. Since v33 anything else is ignored rather than stored. An out-of-range entry was never used for a move (the module falls back to even spacing for it), so ignoring it changes no display; it only stops impossible values such as `65368` turning up in dumps and backups.
+
 ---
 
 #### `e` — Erase flap position map
@@ -444,18 +483,22 @@ m<ID>A:<version>:<moduleId>:<serialNumber>:<homeOffset>:<totalSteps>:<autoHome>:
 
 **Example response:**
 ```
-m38A:32:38:A3F24C0018E7D29B3F01:2832:4096:1:0:0=0,7=342:64: ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$&()-+=;q:%'.,/?*roygbpw\n
+m38A:33:38:A3F24C0018E7D29B3F01:2832:4096:1:0:0=0,7=342:64: ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$&()-+=;q:%'.,/?*roygbpw\n
 ```
 
 > **`<flapCount>` and `<flapChars>` were appended in v31.** They come *after* the variable-length flap map, so every field up to and including the map is byte-for-byte identical to the pre-v31 format and **older controllers keep working unchanged** (they just ignore the tail). `<flapChars>` is the **final** field and may itself contain `:`, `,` or `=`, so read it verbatim to end-of-line — do not split it further. This is exactly the tail that the [`mXW` restore](#serial-number-variants-of-other-commands) accepts, so an `A` dump round-trips back into a module.
 
-Direct-addressed `m<ID>A` and serial-number `mXA<sn>` forms reply synchronously. The broadcast form `m*A` **is** supported and staggered, with an optional ID range — but because each `A` frame is long (~570 ms), a full sweep is slow; prefer ranged batches on large buses:
+A dump is never truncated. A fully calibrated 64-flap module answers with about 630 bytes (~0.65 s at 9600 baud); the longest line the firmware can build at all, five-digit positions in every map entry plus a 64-character set, is about 700 bytes, and the build checks that it fits the reply buffer. Since v33 a flap-character cell that EEPROM corruption has turned into a line terminator is sent as `?`, so it cannot end the frame early.
+
+Direct-addressed `m<ID>A` and serial-number `mXA<sn>` forms reply synchronously. The broadcast form `m*A` **is** supported and staggered, with an optional ID range — but because each `A` frame is long (~0.65 s), a full sweep is slow; prefer ranged batches on large buses:
 
 ```
 m*A\n         → all provisioned modules answer (wide ~700 ms slots)
 m*A0-49\n     → only IDs 0–49 answer
 m*A50-99\n    → only IDs 50–99 answer
 ```
+
+Broadcast slot timing is the same as for `v` (see the note there), with a 700 ms slot.
 
 ---
 
@@ -470,12 +513,18 @@ m<ID>v:<version>:<moduleId>:<serialNumber>\n
 
 **Examples:**
 ```
-m38v\n        → m38v:32:38:A3F24C0018E7D29B3F01\n
+m38v\n        → m38v:33:38:A3F24C0018E7D29B3F01\n
 m*v\n         → every provisioned module replies in sequence, each in its own slot
 m*v0-49\n     → only IDs 0–49 reply (poll the bus in retryable batches)
 ```
 
 > On a broadcast `m*v`, each module delays its reply by a fixed lead-in plus `(moduleId − rangeLo) × 100 ms` before asserting the bus, so replies arrive as a clean, collision-free sequence. The optional `<lo>-<hi>` range lets a controller poll a large bus in batches and re-issue only the ranges that come back incomplete — far more reliable at scale than one all-or-nothing sweep. A plain `m*v` is equivalent to `m*v0-254`.
+
+**Broadcast slot timing in detail** (`m*v` and `m*A`):
+
+- **The clock starts at the broadcast's terminator.** A module schedules its slot when it parses the `\n` or `\r` that ends the query, or after 50 ms of silence if the query has none. A module that is busy when the query arrives (for example still turning its reel) parses it late and answers late by the same amount.
+- **Carrier sense (v33).** When its slot comes round, a module only transmits once the bus has been quiet for 20 ms. A slot that would land on another frame, such as a late neighbour or a controller that has already moved on, waits for the bus instead of destroying both frames. An on-time slot always sees that much quiet, so on a healthy bus nothing moves; the `Q` counter `bcastLate` shows how often a module had to wait.
+- **Later slots land later than nominal.** While bytes are on the bus, every module's millisecond clock runs about 15% slow: the software serial port masks interrupts for about 1 ms per byte, longer than the 0.82 ms clock tick, and a tick that falls in the same window as another is lost. A module therefore answers later than `lead-in + (id − lo) × slot` by roughly 15% of the reply traffic before its slot; in a 16-ID `m*A` batch of fully calibrated modules the last reply comes about 1.5 s after its nominal time. The lag grows with slot position, so it spreads replies apart and never pushes them together; it only means a controller should wait a little longer than the nominal window for the last slot.
 
 ---
 
@@ -537,7 +586,7 @@ Returns an instantaneous module health snapshot. **No motor movement**, so it is
 
 **Response format:**
 ```
-m<ID>Q:<resetCause>:<bootCount>:<vcc_mV>:<eepromOk>:<curIndex>\n
+m<ID>Q:<resetCause>:<bootCount>:<vcc_mV>:<eepromOk>:<curIndex>:<rxOverflows>:<bcastSent>:<bcastLate>:<crcErrors>\n
 ```
 
 | Field | Meaning |
@@ -547,13 +596,19 @@ m<ID>Q:<resetCause>:<bootCount>:<vcc_mV>:<eepromOk>:<curIndex>\n
 | `vcc_mV` | Measured supply voltage in millivolts |
 | `eepromOk` | `1` if the EEPROM write-read-verify check passed, else `0`. The check itself (two write cycles on a scratch cell) runs on the first `Q` after boot and then at most once per hour; polls in between return the cached result, so `Q` is safe to poll frequently |
 | `curIndex` | Current flap index (`-1` = position unknown / needs homing) |
+| `rxOverflows` | (v33) Times the receive buffer overflowed since boot, i.e. bytes arrived faster than the module could read them because it was busy (turning the reel, self-testing, writing EEPROM). Each overflow also means one frame was abandoned rather than acted on half-received |
+| `bcastSent` | (v33) Staggered broadcast replies (`m*v` / `m*A`) the module has transmitted since boot. Compare with how many the controller actually received |
+| `bcastLate` | (v33) How many of those went out after their slot because the bus was busy (carrier sense), a frame was still arriving, or the module itself was busy |
+| `crcErrors` | (v33) [Checksummed](#checksums-optional-v33) frames for this module (its ID, a broadcast, or `X`) that were dropped because the checksum was malformed or didn't match, or the frame was too long |
+
+The four v33 counters live in RAM, restart from 0 at every boot and wrap at 65535, so compare successive readings rather than absolute values. Older controllers ignore them.
 
 **Example response:**
 ```
-m38Q:0:2:4980:1:0\n
+m38Q:0:2:4980:1:0:0:12:0:0\n
 ```
 
-> Watch for a non-zero watchdog (`0x08`) or brown-out (`0x02`) reset bit, a supply voltage sagging below your design target under load, `eepromOk = 0`, or a `bootCount` that keeps climbing between polls.
+> Watch for a non-zero watchdog (`0x08`) or brown-out (`0x02`) reset bit, a supply voltage sagging below your design target under load, `eepromOk = 0`, or a `bootCount` that keeps climbing between polls. An idle module reads its receive buffer as fast as the bus can fill it, so `rxOverflows` should only move while the module is busy; `bcastSent` running ahead of the replies the controller heard points at collisions or wiring rather than at the module.
 
 ---
 
@@ -668,7 +723,7 @@ Several commands have an `mX<letter><serialNumber>` form that targets a single m
 | `mXA<sn>` | Combined all-fields dump by serial number | Same as `A` |
 | `mXF<sn>` | Factory-reset EEPROM by serial number (preserves module ID) | None |
 | `mXN<sn>:<count>:<chars>` | Configure the flap set by serial number (both parts optional; same semantics as the `N` command) | None |
-| `mXW<sn>:<homeOffset>:<totalSteps>:<idx>=<pos>,...[:<flapCount>:<flapChars>]` | Restore a previously dumped EEPROM image (preserves module ID; map entries absent from the payload are cleared; the optional flap-set tail is restored if present) | None |
+| `mXW<sn>:<homeOffset>:<totalSteps>:<idx>=<pos>,...[:<flapCount>:<flapChars>]` | Restore a previously dumped EEPROM image (preserves module ID; map entries absent from the payload are cleared, and so are entries whose position is outside `0` to `<totalSteps>` − 1; the optional flap-set tail is restored if present) | None |
 | `mXT<sn>` | Hall sensor self-test by serial number | Same as `T` |
 | `mXQ<sn>` | Diagnostics snapshot by serial number | Same as `Q` |
 | `mXM<sn>` | Mechanical self-test by serial number | Same as `M` |
@@ -677,7 +732,7 @@ Several commands have an `mX<letter><serialNumber>` form that targets a single m
 
 ```
 mXAA3F24C0018E7D29B3F01\n
-→  m38A:32:38:A3F24C0018E7D29B3F01:2832:4096:1:0:0=0,7=342:64: ABC…w\n
+→  m38A:33:38:A3F24C0018E7D29B3F01:2832:4096:1:0:0=0,7=342:64: ABC…w\n
 
 mXWA3F24C0018E7D29B3F01:2832:4096:0=0,7=342:64: ABC…w\n
 ```
@@ -878,7 +933,7 @@ Follow these steps when setting up a module for the first time or after a mechan
 
 9. **Confirm firmware version and check hardware health:**
    ```
-   m38v\n            → m38v:32:38:A3F24C0018E7D29B3F01\n
+   m38v\n            → m38v:33:38:A3F24C0018E7D29B3F01\n
    m38T\n            → Hall sensor self-test (expect code 0)
    m38M\n            → mechanical self-test (expect code 0, near-zero spread)
    m38Q\n            → diagnostics snapshot (check supply voltage, reset cause)
@@ -921,6 +976,8 @@ With PlatformIO: run `pio run -t fuses` **once per chip** (the equivalent of the
 | v6 or later | `0x5D` | Loaded as-is — no migration needed |
 | v8 or v9 | `0x5E` | Fields loaded, magic rewritten to `0x5D` |
 | Blank chip | `0xFF` | Full default init, ID set to 255 |
+
+> **Upgrading to v33:** just upload; no fuse change, same EEPROM layout, and every reply to a plain message is unchanged except `Q`, which gains four counters at the end (older controllers ignore them). Messages may now carry an optional [checksum](#checksums-optional-v33). Behaviour differences a controller may notice: a frame sent shortly after a busy module's receive buffer overflowed is now answered instead of discarded, broadcast replies wait for a quiet bus, out-of-range flap positions are refused by `w` and `mXW`, and `+` with no index is ignored. See [RELEASE_NOTES.md](RELEASE_NOTES.md).
 
 > **Upgrading to v32:** the fuses now enable the brown-out detector, so **run `pio run -t fuses` once on every module** in addition to the upload (see [SETUP.md](SETUP.md)). Fuse writes do not erase EEPROM. Nothing else changes: same commands, same replies, same EEPROM layout.
 
