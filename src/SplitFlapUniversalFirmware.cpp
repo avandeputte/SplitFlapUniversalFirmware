@@ -53,11 +53,17 @@
 //            auto-detected on first boot and at every calibrate, so this is only
 //            needed after re-mounting a magnet without a full recalibration.
 //  Q         Diagnostics snapshot (DIRECT-ADDRESSED ONLY, no motor movement):
-//              m<id>Q:<resetCause>:<bootCount>:<vcc_mV>:<eepromOk>:<curIndex>\n
+//              m<id>Q:<resetCause>:<bootCount>:<vcc_mV>:<eepromOk>:<curIndex>:<rxOverflows>:<bcastSent>:<bcastLate>\n
 //            resetCause = raw RSTFR bits from last reset (0x01 power-on,
 //            0x02 brown-out, 0x04 external, 0x08 watchdog, 0x10 software);
 //            bootCount = boots since counter reset (wraps 255); vcc_mV =
 //            supply millivolts; eepromOk = 1 if EEPROM verify passed.
+//            Appended in v33, bus counters since boot (RAM only, wrap 65535):
+//            rxOverflows = times the receive ring overflowed (bytes were lost
+//            while the module was busy); bcastSent = staggered broadcast
+//            replies (m*v / m*A) transmitted; bcastLate = how many of those
+//            went out after their slot (held back by carrier sense, a frame
+//            still arriving, or a busy module).
 //  M[<n>]    Mechanical self-test (DIRECT-ADDRESSED ONLY, drives the motor):
 //              m<id>M:<code>:<min>:<max>:<spreadTenthsPct>:<gateActive>:<gateSpan>:<avgMagnetWidth>:<r1>,<r2>,...,<rN>\n
 //            Samples several revolutions and compares them.  Bare 'm<id>M' uses
@@ -123,12 +129,20 @@
 //  v         Report firmware version and serial number  → replies m<id>v:<version>:<moduleId>:<serialNumber>\n
 //            Broadcast form may carry an optional ID range to poll the bus in
 //            batches (recommended for large installations):
-//              m*v\n        → all provisioned modules answer (slot = id × 45 ms)
-//              m*v0-49\n    → only IDs 0–49 answer (slot = (id-lo) × 45 ms)
+//              m*v\n        → all provisioned modules answer (slot = id × 100 ms)
+//              m*v0-49\n    → only IDs 0–49 answer (slot = (id-lo) × 100 ms)
 //              m*v50-99\n   → only IDs 50–99 answer
 //            The Pi polls one batch at a time and re-issues any batch that
 //            returns incomplete, which is far more reliable at 200+ modules
 //            than a single full-bus sweep.
+//            Slot timing (m*v and m*A): the clock starts when the module parses
+//            the broadcast's terminator ('\n'/'\r', or 50 ms of silence if there
+//            is none); the reply goes out at REPLY_LEADIN_MS + (id-lo) × slot,
+//            once the bus has been quiet for CSMA_LISTEN_MS (v33).  millis()
+//            loses ~15% while bytes are on the bus (SoftwareSerial masks
+//            interrupts for ~1 ms per byte), so later slots land later than
+//            nominal by ~15% of the reply traffic before them.  The lag only
+//            grows with slot index, so it spreads replies apart, never together.
 //  F         Factory-reset EEPROM defaults (preserves module ID and magic byte)
 //
 // Provisioning commands (address mX, all modules respond):
@@ -189,6 +203,32 @@
 // ==============================================================================
 // CHANGE LOG
 // ==============================================================================
+//   v33 — Bus robustness, from gateway soak tests.  No EEPROM-layout change;
+//         the only wire-format change is three fields appended to 'Q'.
+//         - After an RX overflow the spliced-tail discard now ends after
+//           RX_RESYNC_GAP_MS (5 ms) of silence instead of 200 ms, so a clean
+//           frame sent after the junk is no longer eaten.
+//         - Staggered broadcast replies (m*v / m*A) carrier-sense first: a slot
+//           that comes round while another frame is on the wire waits for
+//           CSMA_LISTEN_MS of quiet instead of transmitting on top of it.  The
+//           advertisement uses the same non-blocking check.
+//         - 'Q' appends :<rxOverflows>:<bcastSent>:<bcastLate> (since boot).
+//         - A flap position outside the revolution is rejected when written by
+//           'w' or an mXW restore, instead of being stored (a negative restore
+//           value used to land in EEPROM as e.g. 65368).
+//         - A corrupt flap-char cell holding '\n'/'\r' is sent as '?' in the
+//           'A' dump, so it cannot end the frame early.
+//         - The worst-case 'A' line is checked at compile time against the work
+//           buffer: a dump can never be truncated.
+//         - Every transmission starts with a watchdog reset.
+//         - '+' with no digits is now ignored, like every other numeric command
+//           (it used to move to flap 0).
+//         - No printf: the dumps are formatted by appendNum/appendStr instead of
+//           snprintf, byte for byte the same, so the ~1 KB printf library and
+//           the "-Wl,-u,vfprintf -lprintf_min" build flags are gone.
+//         - Internal: idle timeouts feed a synthetic '\n' through the parser
+//           instead of duplicating each command's terminator handling.
+//         Flash 16244 → 14743 bytes (99.1% → 90.0%); RAM +5 bytes.
 //   v32 — Robustness release: no wire-format or EEPROM-layout change.
 //         - Brown-out detector now ENABLED at 2.6 V (fuse; re-run "fuses" once
 //           per module).  BOD off at 10 MHz let the CPU run out of spec on every
@@ -349,7 +389,7 @@
 // prototyped before this enum exists, compilation fails with
 // "PendingReply was not declared in this scope".  Keeping the enum here, ahead of
 // all other declarations, guarantees the generated prototypes can see it.
-enum PendingReply { REPLY_NONE, REPLY_VERSION, REPLY_ALL };
+enum PendingReply : uint8_t { REPLY_NONE, REPLY_VERSION, REPLY_ALL };
 
 // ── Forward declarations ─────────────────────────────────────────────────────
 // In a .cpp the Arduino IDE's automatic prototype generation does not run, so
@@ -361,7 +401,6 @@ bool serialMatches(const char *candidate);
 uint16_t readVccMillivolts();
 bool eepromHealthOk();
 void seedRandom();
-void updateIdChars();
 void schedulePendingReply(PendingReply type, bool isBroadcast);
 void eepromUpdateByte(int addr, uint8_t value);
 void saveHomeOffset();
@@ -374,6 +413,8 @@ void loadFlapConfig();
 void setFlapChars(const char *src, int len);
 void applyFlapConfig();
 void clearFlapMap();
+void writeFlapPos(long idx, long pos, int idxLimit);
+bool busQuiet();
 void txBegin();
 void txEnd();
 void sendLine(const char *s);
@@ -413,7 +454,7 @@ void gotoRawStep(long target);
 
 // ── Firmware version ──────────────────────────────────────────────────────────
 // Returned by the 'v', 'A', and mXA commands.  Bump when you change behaviour.
-const char FIRMWARE_VERSION[] = "32";
+const char FIRMWARE_VERSION[] = "33";
 
 // ── Pin assignments ───────────────────────────────────────────────────────────
 // RS-485 transceiver
@@ -458,7 +499,11 @@ const unsigned long REPLY_SLOT_MS     = 100UL;
 const unsigned long REPLY_ALL_SLOT_MS = 700UL;
 const unsigned long REPLY_LEADIN_MS   =  30UL;
 
-// ── Carrier-sense window before transmitting an advertisement (ms) ───────────
+// ── Carrier sense (ms) ────────────────────────────────────────────────────────
+// An advertisement or a staggered broadcast reply is only transmitted once the
+// bus has been quiet for this long.  Keep it below the quiet gap a normal slot
+// leaves (lead-in 30 ms; v slot 100 ms minus a ~35 ms frame) so an on-time
+// reply is never held back.
 const unsigned long CSMA_LISTEN_MS = 20UL;
 
 // ── Watchdog timeout ──────────────────────────────────────────────────────────
@@ -710,19 +755,6 @@ int     totalStepsPerRev    = 4096;
 // first detection runs.
 uint8_t hallActiveLevel = HALL_DEFAULT_ACTIVE;
 
-// idChars: two-character zero-padded decimal ID used in outbound responses.
-// Kept for response format compatibility with v6 tooling (IDs 0-99).
-// IDs 100-254 use printModuleId() which outputs the full decimal string.
-char idChars[2] = {'*', '*'};
-
-void updateIdChars() {
-  if (moduleId < 100) {
-    idChars[0] = (moduleId / 10) + '0';
-    idChars[1] = (moduleId % 10) + '0';
-  }
-  // IDs >= 100: idChars unused; responses use printModuleId() directly.
-}
-
 // ==========================================
 //               GLOBALS
 // ==========================================
@@ -763,6 +795,22 @@ int  tempIndex        = -1;
   #error "WORK_BUF too small for restore payload"
 #endif
 static char workBuf[DUMP_BUF_SIZE];
+
+// Worst case for the longest line assembled in workBuf, the 'A' reply, counted
+// field by field with every value at its widest: "m" + id(3) + "A:" + version +
+// ":" + id(3) + ":" + serial(20) + ":" + three ints of up to 6 chars ("-32768")
+// each followed by ":", plus autoHome(1) + ":"; then the map at most 9 bytes per
+// entry ("63=65534,"); then ":" + count(3) + ":" + the chars + the null.  That is
+// 703 bytes, and the map ends by byte 633, so the guards in appendFlapMap() (708)
+// and dumpAll() (718) can never trip: a dump is never truncated.  If MAX_FLAPS or
+// a field grows, the build fails here rather than a dump silently losing entries.
+#define DUMP_WORST_HEAD (1 + 3 + 2 + (sizeof(FIRMWARE_VERSION) - 1) + 1 + 3 + 1 + \
+                         SERIAL_LEN * 2 + 1 + 3 * (6 + 1) + 1 + 1)
+#define DUMP_WORST_MAP  (MAX_FLAPS * 9)
+static_assert(DUMP_WORST_HEAD + DUMP_WORST_MAP <= DUMP_BUF_SIZE - 12,
+              "a full flap map could reach the appendFlapMap() guard");
+static_assert(DUMP_WORST_HEAD + DUMP_WORST_MAP + 1 + 3 + 1 + MAX_FLAPS + 1 <= DUMP_BUF_SIZE,
+              "the longest 'A' dump does not fit workBuf");
 
 // restoreBuf is an alias into the shared buffer (used while accumulating mXW).
 char *const restoreBuf = workBuf;  int restoreLen = 0;
@@ -853,8 +901,17 @@ bool   snColonSeen = false;
 // Set by the RX overflow guard in loop() once the last byte received BEFORE a
 // ring-buffer overflow has been consumed: what follows is the tail of some
 // frame spliced onto the gap, so bytes are dropped until the next terminator
-// (or 200 ms idle) instead of being parsed into a field and written to EEPROM.
+// (or RX_RESYNC_GAP_MS of silence) instead of being parsed into a field and
+// written to EEPROM.
 bool   rxDiscard   = false;
+// A frame's bytes arrive back to back (~1 ms apart at 9600 baud), so a silence
+// this long means any spliced tail is over: the discard ends and the next byte
+// is parsed normally.  In v32 the discard ran until a terminator or 200 ms of
+// silence, so a clean frame sent soon after the junk lost its own terminator to
+// clearing the discard and was eaten whole.  The bytes measured here are read
+// live (an idle loop drains the ring as they arrive); a backlog read after a
+// busy spell comes in a fast burst and never looks like a gap.
+const unsigned long RX_RESYNC_GAP_MS = 5UL;
 // Bytes still to consume from BEFORE an overflow gap (see the guard in loop());
 // 0 = no overflow pending.  Consuming the last of them arms rxDiscard.
 uint8_t rxCut      = 0;
@@ -862,6 +919,19 @@ uint8_t rxCut      = 0;
 // action takes no parameters (H/D/A/T/Q/M/F).  All seven share one parse state
 // (collect SN → run action) to save flash; provCmd selects the action.
 char   provCmd     = 0;
+
+// Bus counters since boot, reported at the end of the 'Q' snapshot (RAM only;
+// they wrap at 65535, so a controller should compare successive readings).
+//   rxOverflows  times SoftwareSerial's ring overflowed (bytes were dropped
+//                while the module was busy) — each one also means a frame was
+//                abandoned by the overflow guard
+//   bcastSent    staggered broadcast replies (m*v / m*A) transmitted
+//   bcastLate    of those, how many went out after their slot because the bus
+//                was busy (carrier sense), a frame was still arriving, or the
+//                module itself was busy when the slot came
+uint16_t rxOverflows = 0;
+uint16_t bcastSent   = 0;
+uint16_t bcastLate   = 0;
 
 // Abandon whatever frame is in progress: clear every accumulator and return to
 // state 0.  Shared by the RX overflow guard and the catch-all idle timeout.
@@ -960,6 +1030,17 @@ void clearFlapMap() {
   }
 }
 
+// Store one calibrated flap position.  Only a real step position, 0 to
+// totalStepsPerRev-1, is accepted: anything else is never used (moveToIndex()
+// falls back to even spacing for it) and only made dumps look corrupt — a
+// negative position in a restore payload used to be stored as e.g. 65368.
+// Shared by the 'w' command (index bound flapCount) and the mXW restore
+// (MAX_FLAPS, since the payload's flap count only follows the map).
+void writeFlapPos(long idx, long pos, int idxLimit) {
+  if (idx >= 0 && idx < idxLimit && pos >= 0 && pos < totalStepsPerRev)
+    eepromUpdate(ADDR_MAP_START + (int)idx * 2, (uint16_t)pos);
+}
+
 // The saved position field is 2 bytes (0x07-0x08; see the EEPROM layout).
 // currentStepPos is a long, so it is narrowed to int16_t here — writing the long
 // directly spilled its upper two bytes over the saved index (0x09) and the boot
@@ -981,7 +1062,19 @@ void saveState() {
 //   txBegin  assert DE and let the driver settle before the start bit
 //   txEnd    hold DE for the final stop bit, release it, then drain the self-echo
 //   sendLine txBegin + one line + '\n' + txEnd (for the pre-assembled dumps)
+//
+// Carrier sense, shared by the advertisement and the staggered broadcast
+// replies: true when nothing is waiting in the receive ring and no byte has been
+// read for CSMA_LISTEN_MS.  Non-blocking — an idle loop() reads bytes as they
+// arrive, so lastSerialTime is when the bus last carried data.
+bool busQuiet() {
+  return !rs485.available() && millis() - lastSerialTime >= CSMA_LISTEN_MS;
+}
+// The longest transmission is a full 'A' dump: at most ~703 bytes, ~0.75 s at
+// 9600 baud, well inside the 2 s watchdog.  Resetting it here gives every reply
+// the whole window regardless of what ran before it.
 void txBegin() {
+  wdt_reset();
   digitalWrite(RS485_DE, HIGH);
   delayMicroseconds(200);          // driver-enable settle before the start bit
 }
@@ -992,7 +1085,9 @@ void txEnd() {
   // If the ring overflowed while the handler now replying was busy (or loop()
   // was still consuming pre-gap bytes), that drain just threw away the head of
   // a cut frame — so skip its spliced tail up to the next terminator.
-  if (rs485.overflow() || rxCut) { rxCut = 0; rxDiscard = true; }
+  bool ovf = rs485.overflow();
+  if (ovf) rxOverflows++;
+  if (ovf || rxCut) { rxCut = 0; rxDiscard = true; }
 }
 void sendLine(const char *s) {
   txBegin();
@@ -1026,6 +1121,30 @@ void txNumField(long v) {
   rs485.print(v);
 }
 
+// The dumps are the firmware's only formatted output, and they only ever need
+// decimal integers and plain strings, so these two replace snprintf() — and with
+// it the ~1 KB printf library and the build flags that picked its minimal
+// variant (see platformio.ini).  Both write at buf[n] and return the new offset;
+// the static_asserts next to workBuf prove a dump never outgrows the buffer.
+//
+// appendNum: v in decimal ("%d" / "%u"), then sep unless it is '\0'.  Every
+// value dumped is an int or an unsigned, so |v| <= 65535 and 16-bit arithmetic
+// is exact (and quicker than long division on this core).
+int appendNum(char *buf, int n, long v, char sep = '\0') {
+  if (v < 0) { buf[n++] = '-'; v = -v; }
+  char digits[5];                         // 65535 is the widest magnitude
+  uint8_t k = 0;
+  uint16_t u = (uint16_t)v;
+  do { digits[k++] = '0' + u % 10; u /= 10; } while (u);
+  while (k) buf[n++] = digits[--k];
+  if (sep) buf[n++] = sep;
+  return n;
+}
+int appendStr(char *buf, int n, const char *s) {
+  while (*s) buf[n++] = *s++;
+  return n;
+}
+
 // Append the calibrated flap map ("<idx>=<pos>,..." for the ACTIVE flaps with a
 // stored position) to buf at offset n; returns the new offset.  Shared by the
 // 'd' and 'A' dumps.  All EEPROM reads happen here, before the driver is on.
@@ -1037,7 +1156,8 @@ int appendFlapMap(char *buf, int n) {
     if (pos == 0xFFFF) continue;
     if (n > DUMP_BUF_SIZE - 12) break;     // overflow guard
     if (!first) buf[n++] = ',';
-    n += snprintf(&buf[n], DUMP_BUF_SIZE - n, "%d=%u", i, (unsigned)pos);
+    n = appendNum(buf, n, i, '=');
+    n = appendNum(buf, n, pos);
     first = false;
   }
   return n;
@@ -1049,8 +1169,7 @@ int appendFlapMap(char *buf, int n) {
 int appendMsgId(char *buf, int n) {
   buf[n++] = 'm';
   if (moduleId < 10) buf[n++] = '0';
-  n += snprintf(&buf[n], DUMP_BUF_SIZE - n, "%u", (unsigned)moduleId);
-  return n;
+  return appendNum(buf, n, moduleId);
 }
 
 // Dump EEPROM configuration over RS-485 as a SINGLE line:
@@ -1066,10 +1185,10 @@ int appendMsgId(char *buf, int n) {
 //    ATtiny1616's 2 KB SRAM (or fragmenting the heap) when many flap entries were
 //    populated, which made the dump silently produce nothing.
 //
-// Worst case for the plain 'd' dump (all 64 entries, 3-digit ID): ~595 bytes.
-// The combined 'A' message adds version + serial + autohome + curindex (~31
-// bytes more) and still fits the shared workBuf (DUMP_BUF_SIZE, declared with
-// the parser buffers above) with headroom and a guaranteed null terminator.
+// Worst case for the plain 'd' dump (all 64 entries, 5-digit positions): ~600
+// bytes.  The combined 'A' message adds version, serial, autoHome, curIndex and
+// the flap set, at most 703 bytes; the static_asserts next to workBuf prove both
+// fit the shared buffer, so the overflow guards below never truncate a dump.
 
 void dumpEeprom() {
   char *buf = workBuf;              // shared work buffer (see declaration above)
@@ -1077,8 +1196,9 @@ void dumpEeprom() {
 
   // ── Header: m<id>d:<homeOffset>:<totalSteps>: ────────────────────────
   n = appendMsgId(buf, n);
-  n += snprintf(&buf[n], DUMP_BUF_SIZE - n, "d:%d:%d:",
-                stepsFromHallToZero, totalStepsPerRev);
+  n = appendStr(buf, n, "d:");
+  n = appendNum(buf, n, stepsFromHallToZero, ':');
+  n = appendNum(buf, n, totalStepsPerRev, ':');
 
   // ── Map entries: <idx>=<pos>,<idx>=<pos>,... ─────────────────────────
   n = appendFlapMap(buf, n);
@@ -1121,15 +1241,18 @@ void dumpAll() {
   int n = 0;
 
   // ── Header + scalar fields (all reads done before DE is asserted) ────
+  //   A:<version>:<moduleId>:<serial>:<homeOffset>:<totalSteps>:<autoHome>:<curIndex>:
   n = appendMsgId(buf, n);
-  n += snprintf(&buf[n], DUMP_BUF_SIZE - n, "A:%s:%u:%s:%d:%d:%d:%d:",
-                FIRMWARE_VERSION,
-                (unsigned)moduleId,
-                serialStr,
-                stepsFromHallToZero,
-                totalStepsPerRev,
-                autoHomeEnabled ? 1 : 0,
-                currentFlapIndex);
+  n = appendStr(buf, n, "A:");
+  n = appendStr(buf, n, FIRMWARE_VERSION);
+  buf[n++] = ':';
+  n = appendNum(buf, n, moduleId, ':');
+  n = appendStr(buf, n, serialStr);
+  buf[n++] = ':';
+  n = appendNum(buf, n, stepsFromHallToZero, ':');
+  n = appendNum(buf, n, totalStepsPerRev, ':');
+  n = appendNum(buf, n, autoHomeEnabled ? 1 : 0, ':');
+  n = appendNum(buf, n, currentFlapIndex, ':');
 
   // ── Flap map (only populated, ACTIVE entries) ────────────────────────
   n = appendFlapMap(buf, n);
@@ -1140,11 +1263,16 @@ void dumpAll() {
   //   :<flapCount>:<flapChars>
   // flapChars is the FINAL field and may itself contain ':'/','/'=' — read it
   // verbatim to end-of-line (do not split it further).
-  n += snprintf(&buf[n], DUMP_BUF_SIZE - n, ":%u:", (unsigned)flapCount);
+  buf[n++] = ':';
+  n = appendNum(buf, n, flapCount, ':');
   for (int i = 0; i < MAX_FLAPS; i++) {
     char ch = flapCharAt(i);
     if (ch == '\0') break;                  // end of the configured set
     if (n >= DUMP_BUF_SIZE - 2) break;      // leave room for the null
+    // 'N' and mXW can never store a terminator, so one here is a corrupt
+    // EEPROM cell; sent raw it would end the frame early and the controller
+    // would see an unparseable reply instead of the module's state.
+    if (ch == '\n' || ch == '\r') ch = '?';
     buf[n++] = ch;
   }
 
@@ -1165,13 +1293,9 @@ void scheduleNextAdvertisement() {
 bool sendAdvertisement() {
   // Never discard unread bytes here: anything in the RX buffer is the head of a
   // frame loop() has not parsed yet (possibly a restore addressed to THIS
-  // module).  Unread bytes simply mean the bus is busy — defer.
-  if (rs485.available()) return false;
-
-  unsigned long listenEnd = millis() + CSMA_LISTEN_MS;
-  while (millis() < listenEnd) {
-    if (rs485.available()) return false;    // bus busy — defer
-  }
+  // module).  Unread bytes, or any byte in the last CSMA_LISTEN_MS, simply mean
+  // the bus is busy — defer.  (Before v33 this busy-waited a fresh 20 ms window.)
+  if (!busQuiet()) return false;
 
   txBegin();
   rs485.print("mXadv:");
@@ -1308,10 +1432,9 @@ void restoreEepromFromPayload(const char *payload) {
     if (end == p) break;                   // no number after '='
     p = end;
 
-    if (flapIdx >= 0 && flapIdx < MAX_FLAPS) {
-      uint16_t v = (uint16_t)flapPos;
-      eepromUpdate(ADDR_MAP_START + (flapIdx * 2), v);
-    }
+    // Out-of-range entries are skipped, i.e. left uncalibrated (0xFFFF),
+    // which is how moveToIndex() treated them anyway.
+    writeFlapPos(flapIdx, flapPos, MAX_FLAPS);
     if (*p == ',') p++;                     // step over separator
     else break;                            // end of list (or malformed)
   }
@@ -1632,7 +1755,7 @@ void hallSelfTest() {
 //        DIAGNOSTICS REPORT  ('Q')
 // ==========================================
 // Instantaneous health snapshot — no motor movement.  Reports:
-//   m<id>Q:<resetCause>:<bootCount>:<vcc_mV>:<eepromOk>:<curIndex>\n
+//   m<id>Q:<resetCause>:<bootCount>:<vcc_mV>:<eepromOk>:<curIndex>:<rxOverflows>:<bcastSent>:<bcastLate>\n
 //     resetCause  raw RSTFR bits from the last reset (see RSTCTRL.RSTFR notes;
 //                 e.g. 0x08 = watchdog, 0x02 = brown-out, 0x01 = power-on)
 //     bootCount   boots since the counter was last reset (wraps at 255)
@@ -1644,6 +1767,11 @@ void hallSelfTest() {
 // A controller can watch for: a non-zero watchdog/brown-out reset bit, a VCC
 // sagging below ~4.5 V under load, eepromOk == 0, or a climbing bootCount that
 // indicates the module is silently resetting in the field.
+//   --- appended in v33 (old parsers ignore) ---------------------------------
+//     rxOverflows, bcastSent, bcastLate   bus counters since boot; see their
+//                 declaration.  An idle module drains the ring as fast as the bus
+//                 can fill it, so rxOverflows should only move while the module
+//                 is busy (moving, self-testing, writing EEPROM).
 void reportDiagnostics() {
   uint16_t vcc = readVccMillivolts();
   uint8_t  eeOk = eepromHealthOk() ? 1 : 0;
@@ -1654,6 +1782,9 @@ void reportDiagnostics() {
   txNumField(vcc);
   txNumField(eeOk);
   txNumField(currentFlapIndex);
+  txNumField(rxOverflows);
+  txNumField(bcastSent);
+  txNumField(bcastLate);
   rs485.print("\n");
   txEnd();
 }
@@ -1958,8 +2089,6 @@ void setup() {
   // Load the configurable flap count + char set (defaults when never set).
   loadFlapConfig();
 
-  updateIdChars();
-
   // Sanity-clamp calibration values loaded from EEPROM so a corrupted cell can't
   // produce absurd step counts / divide-by-something-silly later.
   clampCalibration();
@@ -2075,11 +2204,18 @@ void loop() {
   // frame (RX is off during our TX), and (c) for an 'A' reply, overwrite the
   // shared work buffer under a restore payload.  A frame in progress is over
   // in a few ms (a restore in ~650 ms), so the reply is merely delayed.
+  // It also carrier-senses (v33): a parser in state 0 does not mean a quiet bus
+  // — a neighbour's reply is skipped in state 0 — so a slot that comes round
+  // while another frame is still on the wire (a late or busy neighbour, a
+  // controller that moved on) waits for CSMA_LISTEN_MS of quiet instead of
+  // destroying both frames.  An on-time slot always sees that much quiet.
   if (pendingReply != REPLY_NONE && parseState == 0 &&
-      (long)(millis() - pendingReplyTime) >= 0) {
+      (long)(millis() - pendingReplyTime) >= 0 && busQuiet()) {
+    if ((long)(millis() - pendingReplyTime) > 1) bcastLate++;   // held past its slot
     if      (pendingReply == REPLY_VERSION) sendVersionResponse();
     else if (pendingReply == REPLY_ALL)     dumpAll();
     pendingReply = REPLY_NONE;
+    bcastSent++;
   }
 
   // ── Advertisement heartbeat (unprovisioned only) ──────────────────────────
@@ -2095,34 +2231,57 @@ void loop() {
   }
 
   // ── Incoming serial ───────────────────────────────────────────────────────
-  while (rs485.available()) {
-    // ── RX overflow guard ────────────────────────────────────────────────
-    // overflow() reports (and clears) that the ring filled and bytes were
-    // DROPPED while we were busy — a multi-second move or an EEPROM burst,
-    // which is usually the handler of the PREVIOUS byte, hence a per-byte
-    // check.  At that moment the ring is still full and everything in it
-    // arrived BEFORE the gap: complete frames at the head, then the head of
-    // the one frame that was cut.  Parse those normally, but once the last
-    // pre-gap byte is consumed abandon any frame still open (its tail is gone)
-    // and drop what follows up to the next terminator — it is the tail of some
-    // other frame spliced onto the gap.  Without this a busy module could
-    // commit a truncated char set or flap map to EEPROM, or act on a
-    // mis-addressed display frame ("m1" + "3-C" from two different frames).
-    // A second overflow while the first is still being consumed is rare
-    // enough to handle bluntly: drop the lot and resync on the next terminator.
-    if (rs485.overflow()) {
-      if (rxCut == 0) rxCut = (uint8_t)rs485.available();
-      else { while (rs485.available()) rs485.read();
-             rxCut = 0; resetParser(); rxDiscard = true; break; }
-    }
-    char c = rs485.read();
-    lastSerialTime = millis();
-    bool cut = (rxCut && --rxCut == 0);    // c is the last byte before the gap
+  // One pass per received byte.  When the ring is empty, a state that applies
+  // a command and has been idle for 50 ms is fed a synthetic '\n' instead (see
+  // below), so the idle and terminated forms of every command share one path.
+  for (;;) {
+    char c;
+    bool cut = false;
+    if (rs485.available()) {
+      // ── RX overflow guard ──────────────────────────────────────────────
+      // overflow() reports (and clears) that the ring filled and bytes were
+      // DROPPED while we were busy — a multi-second move or an EEPROM burst,
+      // which is usually the handler of the PREVIOUS byte, hence a per-byte
+      // check.  At that moment the ring is still full and everything in it
+      // arrived BEFORE the gap: complete frames at the head, then the head of
+      // the one frame that was cut.  Parse those normally, but once the last
+      // pre-gap byte is consumed abandon any frame still open (its tail is
+      // gone) and drop what follows up to the next terminator or a
+      // RX_RESYNC_GAP_MS silence — it is the tail of some other frame spliced
+      // onto the gap.  Without this a busy module could commit a truncated
+      // char set or flap map to EEPROM, or act on a mis-addressed display
+      // frame ("m1" + "3-C" from two different frames).  An idle module never
+      // gets here: loop() drains the ring as fast as a neighbour can fill it,
+      // however long the neighbour's reply.  A second overflow while the first
+      // is still being consumed is rare enough to handle bluntly: drop the lot
+      // and resync on the next terminator or silence.
+      if (rs485.overflow()) {
+        rxOverflows++;
+        if (rxCut == 0) rxCut = (uint8_t)rs485.available();
+        else { while (rs485.available()) rs485.read();
+               rxCut = 0; resetParser(); rxDiscard = true; break; }
+      }
+      c = rs485.read();
+      lastSerialTime = millis();
+      cut = (rxCut && --rxCut == 0);       // c is the last byte before the gap
 
-    if (rxDiscard) {                       // skipping a spliced tail
-      if (c == '\n' || c == '\r') rxDiscard = false;
-      if (cut) rxDiscard = true;           // ...but the gap follows: keep skipping
-      continue;
+      if (rxDiscard) {                     // skipping a spliced tail
+        if (c == '\n' || c == '\r') rxDiscard = false;
+        if (cut) rxDiscard = true;         // ...but the gap follows: keep skipping
+        continue;
+      }
+    } else if (millis() - lastSerialTime > 50 &&
+               ((parseState >= 5 && parseState <= 12) || parseState == 18 ||
+                parseState == 23 || parseState == 24)) {
+      // ── Idle timeout: end a frame that came without a terminator ───────
+      // The numeric commands (5-12), the broadcast range (18), the 'M' count
+      // (23) and the 'N' flap set (24) all act on their terminator.  Within a
+      // frame bytes arrive ~1 ms apart, so 50 ms of silence means the frame
+      // truly ended: run exactly the terminator path, as if '\n' had arrived.
+      // (Before v33 each of these was a hand-copied twin of its handler.)
+      c = '\n';
+    } else {
+      break;
     }
 
     switch (parseState) {
@@ -2343,10 +2502,7 @@ void loop() {
         if (c == ':')        { tempIndex = (int)bufToLong(numBuf, numLen); bufClear(numBuf, numLen); }
         else if (isDigit(c)) { bufAppend(numBuf, numLen, NUMBUF_MAX, c); }
         else {
-          if (numLen > 0 && tempIndex >= 0 && tempIndex < flapCount) {
-            uint16_t pos = (uint16_t)bufToLong(numBuf, numLen);
-            eepromUpdate(ADDR_MAP_START + (tempIndex * 2), pos);
-          }
+          if (numLen > 0) writeFlapPos(tempIndex, bufToLong(numBuf, numLen), flapCount);
           parseState = 0;
         }
         break;
@@ -2357,7 +2513,6 @@ void loop() {
         if (numLen > 0) {
           moduleId = (uint8_t)bufToLong(numBuf, numLen);
           eepromUpdateByte(ADDR_MODULE_ID, moduleId);
-          updateIdChars();
         }
         parseState = 0; break;
 
@@ -2374,7 +2529,7 @@ void loop() {
       // ── State 12: '+' flap by index (v7+) ─────────────────────────────
       case 12:
         if (isDigit(c)) { bufAppend(numBuf, numLen, NUMBUF_MAX, c); break; }
-        moveToIndex((int)bufToLong(numBuf, numLen));
+        if (numLen > 0) moveToIndex((int)bufToLong(numBuf, numLen));
         parseState = 0; break;
 
       // ── State 13: parameterless provisioning-by-SN (H/D/A/T/Q/M/F) ────
@@ -2407,7 +2562,6 @@ void loop() {
           if (snColonSeen && numLen > 0 && serialMatches(snBuf)) {
             moduleId = (uint8_t)bufToLong(numBuf, numLen);
             eepromUpdateByte(ADDR_MODULE_ID, moduleId);
-            updateIdChars();
 
             delay(20);
             txBegin();
@@ -2497,7 +2651,7 @@ void loop() {
       //   - before the FIRST ':' → digits accumulate as the flap count
       //   - after  the FIRST ':' → every byte (incl. further ':') is a flap
       //     char, taken verbatim until the terminator
-      // Applied on '\n'/'\r' (or the 50 ms idle timeout below).  No reply.
+      // Applied on '\n'/'\r' (or after 50 ms idle, which feeds a '\n').  No reply.
       case 24:
         if (!snColonSeen) {
           if (c == ':')             { snColonSeen = true; }          // → chars
@@ -2555,81 +2709,20 @@ void loop() {
     // Last pre-gap byte consumed (see the overflow guard above): whatever frame
     // is still open lost its tail — abandon it and skip the spliced remainder.
     if (cut) { resetParser(); rxDiscard = true; }
-  }  // end while(rs485.available())
+  }  // end for (one pass per byte)
 
-  // ── Timeout: flush incomplete numeric commands (50 ms idle) ───────────────
-  if (parseState >= 5 && parseState <= 12 && (millis() - lastSerialTime > 50)) {
-    if (numLen > 0) {
-      switch (parseState) {
-        case 5:  stepsFromHallToZero = (int)bufToLong(numBuf, numLen); saveHomeOffset(); break;
-        case 6:  totalStepsPerRev = (int)bufToLong(numBuf, numLen); saveTotalSteps(); break;
-        case 7:  { int n = (int)bufToLong(numBuf, numLen); nudge(n); } break;
-        case 8:  gotoRawStep(bufToLong(numBuf, numLen)); break;
-        case 9:  if (tempIndex >= 0 && tempIndex < flapCount) {
-                   uint16_t pos = (uint16_t)bufToLong(numBuf, numLen);
-                   eepromUpdate(ADDR_MAP_START + (tempIndex * 2), pos);
-                 } break;
-        case 10: moduleId = (uint8_t)bufToLong(numBuf, numLen);
-                 eepromUpdateByte(ADDR_MODULE_ID, moduleId); updateIdChars(); break;
-        case 11: autoHomeEnabled = (bufToLong(numBuf, numLen) == 1);
-                 eepromUpdateByte(ADDR_AUTO_HOME, autoHomeEnabled ? 1 : 0);
-                 saveState(); break;
-        case 12: moveToIndex((int)bufToLong(numBuf, numLen)); break;
-      }
-    }
-    bufClear(numBuf, numLen);
-    parseState = 0;
-  }
+  unsigned long idle = millis() - lastSerialTime;
 
-  // ── Timeout: run a direct 'M' that arrived without a terminator (50 ms) ───
-  // State 23 collects an optional revolution count after 'm<id>M'.  If the line
-  // idles with no terminator, run the test now with the parsed count (or the
-  // default if none was given).
-  if (parseState == 23 && (millis() - lastSerialTime > 50)) {
-    mechanicalTest(numLen > 0 ? (int)bufToLong(numBuf, numLen) : MECH_TEST_REVS);
-    bufClear(numBuf, numLen);
-    parseState = 0;
-  }
+  // ── Timeout: end the overflow discard after a short silence ──────────────
+  // A spliced tail is contiguous, so RX_RESYNC_GAP_MS without a byte means it
+  // is over and whatever arrives next is a fresh frame (see RX_RESYNC_GAP_MS).
+  if (rxDiscard && idle > RX_RESYNC_GAP_MS) rxDiscard = false;
 
-  // ── Timeout: apply an 'N' flap-config that arrived without a terminator ───
-  // State 24 collects m<id>N<count>:<chars>.  Within a frame, bytes arrive ~1 ms
-  // apart, so a 50 ms idle means the frame truly ended; apply whatever parsed.
-  if (parseState == 24 && (millis() - lastSerialTime > 50)) {
-    applyFlapConfig();
-    bufClear(numBuf, numLen); restoreLen = 0; restoreBuf[0] = '\0';
-    snColonSeen = false; parseState = 0;
-  }
-
-  // ── Timeout: flush incomplete provisioning frames (200 ms idle) ───────────
-  // States 13 (H/D/A/T/Q/M/F), 14 (I), 17 (W) and 25 (N) by serial number.
-  if ((parseState == 13 || parseState == 14 || parseState == 17 ||
-       parseState == 25)
-      && (millis() - lastSerialTime > 200)) {
-    bufClear(snBuf, snLen); snColonSeen = false;
-    restoreLen = 0; restoreBuf[0] = '\0'; bufClear(numBuf, numLen); parseState = 0;
-  }
-
-  // ── Timeout: finalise a broadcast version/all range query (50 ms idle) ────
-  // If the line had no explicit terminator, schedule the reply with whatever
-  // range was parsed so far (defaults already set when entering state 18).
-  if (parseState == 18 && (millis() - lastSerialTime > 50)) {
-    if (snColonSeen) {
-      if (numLen > 0) replyRangeHi = (int)bufToLong(numBuf, numLen);
-    } else if (numLen > 0) {
-      replyRangeLo = (int)bufToLong(numBuf, numLen);
-      replyRangeHi = replyRangeLo;
-    }
-    schedulePendingReply(broadcastReplyType, true);
-    bufClear(numBuf, numLen); snColonSeen = false; parseState = 0;
-  }
-
-  // ── Timeout: catch-all — reset ANY parser state left idle for 200 ms ──────
-  // The handlers above cover the states that APPLY something on idle.  This
-  // one covers the rest (1: address, 4: display char) and the overflow-discard
-  // mode, so a lone 'm' from bus noise or a lost terminator can never leave the
-  // parser waiting to swallow the NEXT frame's bytes into the current field.
-  if ((parseState != 0 || rxDiscard) && (millis() - lastSerialTime > 200)) {
-    rxDiscard = false;
-    resetParser();
-  }
+  // ── Timeout: catch-all — abandon ANY parser state left idle for 200 ms ────
+  // The states that APPLY something on idle were already given their
+  // terminator above, after 50 ms.  This covers the rest (1: address, 4:
+  // display char, and the serial-number frames 13/14/17/25), so a lone 'm' from
+  // bus noise or a lost terminator can never leave the parser waiting to
+  // swallow the NEXT frame's bytes into the current field.
+  if (parseState != 0 && idle > 200) resetParser();
 }  // end loop()

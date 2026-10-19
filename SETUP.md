@@ -133,7 +133,7 @@ upload_port  = /dev/cu.usbserial-XXXX    ; macOS example
 
 > If you omit `upload_port`, PlatformIO will try to auto-detect a single connected adapter, which often works when only one is plugged in.
 
-The rest of `platformio.ini` is already configured for this board (ATtiny1616, 10 MHz internal clock, EEPROM-retain fuse, SerialUPDI at 57600 baud, minimal-`printf` size flags, and a 128-byte SoftwareSerial receive buffer via `-D_SS_MAX_RX_BUFF=128`). You normally don't need to change anything else.
+The rest of `platformio.ini` is already configured for this board (ATtiny1616, 10 MHz internal clock, EEPROM-retain fuse, SerialUPDI at 57600 baud, size-optimised build flags, and a 128-byte SoftwareSerial receive buffer via `-D_SS_MAX_RX_BUFF=128`). You normally don't need to change anything else.
 
 > The receive-buffer flag must be applied to the SoftwareSerial *library* build, which `build_flags` does. If you build with the Arduino IDE instead, edit `_SS_MAX_RX_BUFF` in the core's `SoftwareSerial.h`; a `#define` in the sketch does not reach the library.
 
@@ -146,12 +146,12 @@ You don't need hardware connected to *build* — this is a good first check that
 - **In VSCode:** click the **Build** button (the ✓ checkmark) in the bottom status bar, or press `Ctrl+Alt+B`. You can also open the PlatformIO sidebar → *Project Tasks → ATtiny1616 → General → Build*.
 - A terminal panel opens and shows the compile. Success ends with something like:
   ```
-  RAM:   [=====     ]  48.3% (used 990 bytes from 2048 bytes)
-  Flash: [==========]  98.8% (used 16182 bytes from 16384 bytes)
+  RAM:   [=====     ]  52.0% (used 1065 bytes from 2048 bytes)
+  Flash: [========= ]  90.0% (used 14743 bytes from 16384 bytes)
   ========================= [SUCCESS] ... =========================
   ```
 
-> **Heads-up:** the firmware fills ~99% of the chip's 16 KB flash by design. That's expected. If you add code and it overflows ("region `text' overflowed"), see [ARCHITECTURE.md → Memory strategy](ARCHITECTURE.md#memory-strategy).
+> **Heads-up:** the firmware fills ~90% of the chip's 16 KB flash. That's expected. If you add code and it overflows ("region `text' overflowed"), see [ARCHITECTURE.md → Memory strategy](ARCHITECTURE.md#memory-strategy).
 
 ---
 
@@ -194,7 +194,7 @@ Every module runs the **same** binary — there is nothing to change per-module 
 Once flashed and connected to your RS-485 bus, you can confirm the version over the bus (see [README.md](README.md) for the full protocol and the `provision.py` tool):
 
 ```
-m<ID>v\n      → m<ID>v:32:<ID>:<serialNumber>\n
+m<ID>v\n      → m<ID>v:33:<ID>:<serialNumber>\n
 ```
 
 A freshly flashed, never-provisioned module advertises its serial number every ~10–15 seconds and has bus ID 255 until you provision it.
@@ -245,7 +245,7 @@ pio device list         # list serial ports (to fill in upload_port)
 - You are trying to build a `.ino` file. This project is `.cpp` on purpose — PlatformIO's `.ino` preprocessor mis-parses the apostrophes in the comments. Build `src/SplitFlapUniversalFirmware.cpp`.
 
 **`region 'text' overflowed by N bytes`**
-- The firmware is near the 16 KB flash limit. Don't switch away from `-lprintf_min`/`-Os`/`-flto` in `platformio.ini`. If you added code, factor out duplication (see [ARCHITECTURE.md → Memory strategy](ARCHITECTURE.md#memory-strategy)). As a last resort, the bottom of `platformio.ini` documents `board_upload.maximum_size = 16384` to reclaim any flash a bootloader region might reserve.
+- The firmware fills ~90% of the 16 KB flash. Keep `-Os`/`-flto` in `platformio.ini`, and don't add `printf`/`snprintf` calls: since v33 the firmware formats its own output, and any printf-family call would link the ~1 KB printf library back in. If you added code, factor out duplication (see [ARCHITECTURE.md → Memory strategy](ARCHITECTURE.md#memory-strategy)). As a last resort, the bottom of `platformio.ini` documents `board_upload.maximum_size = 16384` to reclaim any flash a bootloader region might reserve.
 
 **Module forgets its ID / calibration after a reflash**
 - The `EESAVE` fuse isn't set. Run the fuses step (Section 9) once per chip. Keep periodic `mXA` dumps so you can restore a module with `mXW` if its EEPROM is ever wiped (see README).

@@ -1,8 +1,36 @@
 # Release Notes
 
-Version history for the Split-Flap Universal Firmware. The firmware version is reported by the `v` and `A` commands (e.g. `m38v` → `m38v:32:38:<serial>`).
+Version history for the Split-Flap Universal Firmware. The firmware version is reported by the `v` and `A` commands (e.g. `m38v` → `m38v:33:38:<serial>`).
 
 All versions from v6 onward share the same EEPROM field layout, and every change to a reply has been **append-only** — new fields are added at the end so older controllers keep working. Upgrading preserves a module's ID and calibration **as long as the `EESAVE` fuse is set** (see [SETUP.md](SETUP.md) § "Write the fuses").
+
+---
+
+## v33 — Bus robustness from gateway soak tests, and no more printf
+
+No fuse change and no EEPROM-layout change: just upload. Every reply is byte-for-byte unchanged except `Q`, which gains three fields at the end. These changes answer the requests the gateway project filed after soak-testing a 64-module wall.
+
+**Receive path**
+- **A clean frame after an overflow is no longer eaten.** When a busy module's receive ring overflows, the firmware still abandons the frame that was cut and skips the spliced tail. The skip now ends after 5 ms of bus silence instead of 200 ms. In v32 a command sent within 200 ms of the module finishing its backlog was discarded, and its own terminator was what cleared the discard; it is now answered whenever it starts 5 ms or more after the junk. (An idle module never overflows: it reads bytes as fast as the bus delivers them, however long a neighbour's reply.)
+- **Commands without a terminator behave exactly like terminated ones.** The 50 ms idle timeout now feeds the parser a `\n` instead of running a separate copy of each command's handling. As a side effect, commands that arrived while such a command was running are no longer lost to the reply of an earlier broadcast.
+- **`+` with no index is ignored**, like every other numeric command (it used to move to flap 0).
+
+**Broadcast replies**
+- **Carrier sense before a staggered reply.** When its slot comes round, a module answering `m*v` or `m*A` waits until the bus has been quiet for 20 ms, so a slot that would land on another frame defers instead of destroying both. On a healthy bus every slot already sees that much quiet, so timing is unchanged. The unprovisioned-module advertisement uses the same check and no longer busy-waits 20 ms.
+- **Timing documented.** The slot clock starts at the broadcast's terminator. While the bus is busy each module's `millis()` runs about 15% slow, so later slots land later than nominal: they are spread apart, never pushed together, and a controller should wait somewhat longer for the last ones. See README → `v`.
+
+**Diagnostics**
+- **`Q` appends `:<rxOverflows>:<bcastSent>:<bcastLate>`**: receive-ring overflows, staggered broadcast replies transmitted, and how many of those had to wait for the bus, all counted since boot. Older controllers ignore the extra fields.
+
+**Dumps and calibration data**
+- **Out-of-range flap positions are refused** by `w` and by the `mXW` restore (which leaves such entries uncalibrated). A negative position in a restore payload used to be stored as e.g. `65368`. The module never used such a value for a move, so nothing on the display changes.
+- **A corrupt flap-character cell holding a line terminator is sent as `?`** in the `A` dump instead of ending the frame early.
+- **A dump can never be truncated**, and the build now proves it: the longest possible `A` line is ~700 bytes against a 720-byte buffer, checked at compile time.
+- **Every transmission starts with a watchdog reset.** The longest reply, a full `A` dump, takes ~0.75 s, well inside the 2 s watchdog.
+
+**Build**
+- **printf is gone.** The dumps were the only formatted output; two small helpers now produce them byte for byte as `snprintf` did, so the ~1 KB printf library and the `-Wl,-u,vfprintf -lprintf_min` flags are out of `platformio.ini`. The build no longer depends on which printf variant a toolchain would pick.
+- Flash use is down from 99.1% to 90.0% (16,244 → 14,743 bytes); RAM +5 bytes.
 
 ---
 
