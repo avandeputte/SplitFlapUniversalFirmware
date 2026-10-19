@@ -6,9 +6,18 @@ All versions from v6 onward share the same EEPROM field layout, and every change
 
 ---
 
-## v33 — Bus robustness from gateway soak tests, and no more printf
+## v33 — Bus robustness from gateway soak tests, optional checksums, and no more printf
 
-No fuse change and no EEPROM-layout change: just upload. Every reply is byte-for-byte unchanged except `Q`, which gains three fields at the end. These changes answer the requests the gateway project filed after soak-testing a 64-module wall.
+No fuse change and no EEPROM-layout change: just upload. Every reply to a plain message is byte-for-byte unchanged except `Q`, which gains four fields at the end, and messages may now carry an optional checksum. These changes answer the requests the gateway project filed after soak-testing a 64-module wall.
+
+**Checksums (optional)**
+- **Any message can carry a checksum:** `~HHHH<message>\n`. `HHHH` is the CRC-16/CCITT-FALSE of the message from its `m` to its terminator, as 4 hex digits; in Python, `binascii.crc_hqx(message, 0xFFFF)`.
+- **A module checks it before acting on the message.** A frame that fails is dropped and counted in `Q` (`crcErrors`).
+- **A frame that passes runs exactly as the plain message would**, and every reply it causes carries a checksum in the same form, staggered broadcast replies included.
+- **Messages without a checksum are handled and answered exactly as before.**
+- **Older firmware skips the checksum** and runs the message unchecked, so checksums work on mixed walls, broadcasts included.
+- See README → *Checksums* for the details, including why a checksummed message should always be terminated.
+- **All replies are now assembled before transmitting.** The bytes are unchanged; this is what lets the checksum go in front.
 
 **Receive path**
 - **A clean frame after an overflow is no longer eaten.** When a busy module's receive ring overflows, the firmware still abandons the frame that was cut and skips the spliced tail. The skip now ends after 5 ms of bus silence instead of 200 ms. In v32 a command sent within 200 ms of the module finishing its backlog was discarded, and its own terminator was what cleared the discard; it is now answered whenever it starts 5 ms or more after the junk. (An idle module never overflows: it reads bytes as fast as the bus delivers them, however long a neighbour's reply.)
@@ -20,7 +29,13 @@ No fuse change and no EEPROM-layout change: just upload. Every reply is byte-for
 - **Timing documented.** The slot clock starts at the broadcast's terminator. While the bus is busy each module's `millis()` runs about 15% slow, so later slots land later than nominal: they are spread apart, never pushed together, and a controller should wait somewhat longer for the last ones. See README → `v`.
 
 **Diagnostics**
-- **`Q` appends `:<rxOverflows>:<bcastSent>:<bcastLate>`**: receive-ring overflows, staggered broadcast replies transmitted, and how many of those had to wait for the bus, all counted since boot. Older controllers ignore the extra fields.
+- **`Q` appends `:<rxOverflows>:<bcastSent>:<bcastLate>:<crcErrors>`**, all counted since boot:
+  - receive-ring overflows;
+  - staggered broadcast replies transmitted;
+  - how many of those had to wait for the bus;
+  - checksummed frames for this module that failed their check.
+
+  Older controllers ignore the extra fields.
 
 **Dumps and calibration data**
 - **Out-of-range flap positions are refused** by `w` and by the `mXW` restore (which leaves such entries uncalibrated). A negative position in a restore payload used to be stored as e.g. `65368`. The module never used such a value for a move, so nothing on the display changes.
@@ -30,7 +45,7 @@ No fuse change and no EEPROM-layout change: just upload. Every reply is byte-for
 
 **Build**
 - **printf is gone.** The dumps were the only formatted output; two small helpers now produce them byte for byte as `snprintf` did, so the ~1 KB printf library and the `-Wl,-u,vfprintf -lprintf_min` flags are out of `platformio.ini`. The build no longer depends on which printf variant a toolchain would pick.
-- Flash use is down from 99.1% to 90.0% (16,244 → 14,743 bytes); RAM +5 bytes.
+- Flash use is down from 99.1% to 92.7% (16,244 → 15,181 bytes), checksums included; RAM +11 bytes.
 
 ---
 

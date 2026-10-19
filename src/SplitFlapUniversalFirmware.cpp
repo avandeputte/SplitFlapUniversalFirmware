@@ -28,6 +28,41 @@
 //   m**h   m*h   m38h   m038h   m5h   m138h   mXH...
 //
 // ==============================================================================
+// CHECKSUMS  (optional, v33+)
+// ==============================================================================
+//
+// Any message may be sent with a checksum in front of it:
+//
+//   ~ HHHH  m <ADDR> <CMD> [data]  \n
+//
+//   HHHH   CRC-16/CCITT-FALSE of the message itself — every byte from the 'm' up
+//          to, not including, the terminator — as 4 hex digits (either case).
+//          Polynomial 0x1021, initial value 0xFFFF, no reflection, no final XOR;
+//          "123456789" gives 29B1.  Python: binascii.crc_hqx(message, 0xFFFF).
+//
+//   ~C500m05v\n                              → ~5E12m05v:33:5:A3F24C0018E7D29B3F01\n
+//
+// The module collects a checksummed frame whole, up to its terminator (or 50 ms
+// of silence), and checks the checksum before anything in it is acted on.  If
+// it matches, the message runs exactly as the same message sent plain would,
+// and every reply it causes carries a checksum in the same form, computed over
+// the reply from its 'm' to (not including) its '\n'; a staggered broadcast
+// reply is checksummed if its broadcast was.  If it does not match, the frame
+// is dropped silently and, if it was for this module (its ID, a broadcast, or
+// X), counted in the 'Q' counter crcErrors.  A frame without a checksum is
+// handled exactly as before and answered plain.  Advertisements stay plain.
+//   - One command per checksummed frame.
+//   - A checksummed frame is never eaten by the skip that follows a receive
+//     overflow: a spliced frame cannot pass its check.
+//   - If the '~' itself is lost on the wire, what remains reads as a plain frame
+//     and is acted on unchecked (a single error there leaves the message itself
+//     intact) — but it is then answered plain, so a controller that sent a
+//     checksum should treat a plain reply from a v33+ module as a failed exchange.
+//   - Older firmware skips everything before the 'm', so it runs a checksummed
+//     frame unchecked and answers plain: checksums can be sent to a mixed wall,
+//     broadcasts included.
+//
+// ==============================================================================
 // COMMANDS  (all v6 commands preserved exactly)
 // ==============================================================================
 //
@@ -53,7 +88,7 @@
 //            auto-detected on first boot and at every calibrate, so this is only
 //            needed after re-mounting a magnet without a full recalibration.
 //  Q         Diagnostics snapshot (DIRECT-ADDRESSED ONLY, no motor movement):
-//              m<id>Q:<resetCause>:<bootCount>:<vcc_mV>:<eepromOk>:<curIndex>:<rxOverflows>:<bcastSent>:<bcastLate>\n
+//              m<id>Q:<resetCause>:<bootCount>:<vcc_mV>:<eepromOk>:<curIndex>:<rxOverflows>:<bcastSent>:<bcastLate>:<crcErrors>\n
 //            resetCause = raw RSTFR bits from last reset (0x01 power-on,
 //            0x02 brown-out, 0x04 external, 0x08 watchdog, 0x10 software);
 //            bootCount = boots since counter reset (wraps 255); vcc_mV =
@@ -63,7 +98,9 @@
 //            while the module was busy); bcastSent = staggered broadcast
 //            replies (m*v / m*A) transmitted; bcastLate = how many of those
 //            went out after their slot (held back by carrier sense, a frame
-//            still arriving, or a busy module).
+//            still arriving, or a busy module); crcErrors = checksummed frames
+//            for this module dropped because the checksum failed (see
+//            CHECKSUMS).
 //  M[<n>]    Mechanical self-test (DIRECT-ADDRESSED ONLY, drives the motor):
 //              m<id>M:<code>:<min>:<max>:<spreadTenthsPct>:<gateActive>:<gateSpan>:<avgMagnetWidth>:<r1>,<r2>,...,<rN>\n
 //            Samples several revolutions and compares them.  Bare 'm<id>M' uses
@@ -204,7 +241,11 @@
 // CHANGE LOG
 // ==============================================================================
 //   v33 — Bus robustness, from gateway soak tests.  No EEPROM-layout change;
-//         the only wire-format change is three fields appended to 'Q'.
+//         on the wire, four fields appended to 'Q' and optional checksums.
+//         - Optional checksums (see CHECKSUMS): a frame sent as "~HHHH<frame>"
+//           is checked before it runs, dropped and counted if it fails, and
+//           answered with checksummed replies.  Plain frames work as before.
+//           All replies are now assembled before transmitting (same bytes).
 //         - After an RX overflow the spliced-tail discard now ends after
 //           RX_RESYNC_GAP_MS (5 ms) of silence instead of 200 ms, so a clean
 //           frame sent after the junk is no longer eaten.
@@ -212,7 +253,8 @@
 //           that comes round while another frame is on the wire waits for
 //           CSMA_LISTEN_MS of quiet instead of transmitting on top of it.  The
 //           advertisement uses the same non-blocking check.
-//         - 'Q' appends :<rxOverflows>:<bcastSent>:<bcastLate> (since boot).
+//         - 'Q' appends :<rxOverflows>:<bcastSent>:<bcastLate>:<crcErrors>
+//           (since boot).
 //         - A flap position outside the revolution is rejected when written by
 //           'w' or an mXW restore, instead of being stored (a negative restore
 //           value used to land in EEPROM as e.g. 65368).
@@ -228,7 +270,8 @@
 //           the "-Wl,-u,vfprintf -lprintf_min" build flags are gone.
 //         - Internal: idle timeouts feed a synthetic '\n' through the parser
 //           instead of duplicating each command's terminator handling.
-//         Flash 16244 → 14743 bytes (99.1% → 90.0%); RAM +5 bytes.
+//         Flash 16244 → 15181 bytes (99.1% → 92.7%), checksums included;
+//         RAM +11 bytes.
 //   v32 — Robustness release: no wire-format or EEPROM-layout change.
 //         - Brown-out detector now ENABLED at 2.6 V (fuse; re-run "fuses" once
 //           per module).  BOD off at 10 MHz let the CPU run out of spec on every
@@ -417,8 +460,7 @@ void writeFlapPos(long idx, long pos, int idxLimit);
 bool busQuiet();
 void txBegin();
 void txEnd();
-void sendLine(const char *s);
-void printModuleId();
+void sendReply(int n);
 void dumpEeprom();
 void dumpAll();
 void scheduleNextAdvertisement();
@@ -811,6 +853,11 @@ static_assert(DUMP_WORST_HEAD + DUMP_WORST_MAP <= DUMP_BUF_SIZE - 12,
               "a full flap map could reach the appendFlapMap() guard");
 static_assert(DUMP_WORST_HEAD + DUMP_WORST_MAP + 1 + 3 + 1 + MAX_FLAPS + 1 <= DUMP_BUF_SIZE,
               "the longest 'A' dump does not fit workBuf");
+// A checksummed frame is collected whole in workBuf ("~HHHH" + the frame, at
+// most DUMP_BUF_SIZE - 1 bytes), so the longest command, a full mXW restore,
+// must fit as well.
+static_assert(5 + 3 + SNBUF_MAX + 1 + RESTORE_MAX <= DUMP_BUF_SIZE - 1,
+              "a checksummed mXW restore does not fit workBuf");
 
 // restoreBuf is an alias into the shared buffer (used while accumulating mXW).
 char *const restoreBuf = workBuf;  int restoreLen = 0;
@@ -850,6 +897,13 @@ inline long bufToLong(const char *buf, int len) {
 
 PendingReply  pendingReply     = REPLY_NONE;
 unsigned long pendingReplyTime = 0;
+
+// Checksums (see CHECKSUMS in the header): replyCrc is set while a frame that
+// arrived with a valid checksum is being run, and makes every reply it causes
+// carry one too; pendingCrc remembers it for a staggered broadcast reply, which
+// goes out later.  Plain frames get plain replies, exactly as before.
+bool replyCrc   = false;
+bool pendingCrc = false;
 
 // Schedule a deferred reply.  isBroadcast=true uses slot-based timing.
 //
@@ -891,6 +945,7 @@ void schedulePendingReply(PendingReply type, bool isBroadcast) {
     pendingReplyTime = millis() + REPLY_DIRECT_MS;
   }
   pendingReply = type;
+  pendingCrc   = replyCrc;
 }
 
 unsigned long lastSerialTime    = 0;
@@ -915,6 +970,9 @@ const unsigned long RX_RESYNC_GAP_MS = 5UL;
 // Bytes still to consume from BEFORE an overflow gap (see the guard in loop());
 // 0 = no overflow pending.  Consuming the last of them arms rxDiscard.
 uint8_t rxCut      = 0;
+// Length of the checksummed frame being collected in workBuf ("~HHHH<frame>"),
+// 0 = none; DUMP_BUF_SIZE marks one too long for the buffer (see runCrcFrame).
+int    crcLen      = 0;
 // The command letter of a serial-number-addressed provisioning command whose
 // action takes no parameters (H/D/A/T/Q/M/F).  All seven share one parse state
 // (collect SN → run action) to save flash; provCmd selects the action.
@@ -929,16 +987,22 @@ char   provCmd     = 0;
 //   bcastLate    of those, how many went out after their slot because the bus
 //                was busy (carrier sense), a frame was still arriving, or the
 //                module itself was busy when the slot came
+//   crcErrors    checksummed frames for this module (its ID, a broadcast, or X)
+//                dropped because the checksum was malformed or did not match,
+//                or the frame was too long
 uint16_t rxOverflows = 0;
 uint16_t bcastSent   = 0;
 uint16_t bcastLate   = 0;
+uint16_t crcErrors   = 0;
 
-// Abandon whatever frame is in progress: clear every accumulator and return to
-// state 0.  Shared by the RX overflow guard and the catch-all idle timeout.
+// Abandon whatever frame is in progress, checksummed or not: clear every
+// accumulator and return to state 0.  Shared by the RX overflow guard and the
+// catch-all idle timeout.
 void resetParser() {
   bufClear(idBuf, idLen); bufClear(numBuf, numLen); bufClear(snBuf, snLen);
   restoreLen = 0; restoreBuf[0] = '\0';
   snColonSeen = false; idWildcard = false; idProvision = false;
+  crcLen = 0;
   parseState = 0;
 }
 
@@ -1057,11 +1121,14 @@ void saveState() {
 // ==========================================
 //          RESPONSE HELPERS
 // ==========================================
-// RS-485 transmit framing, factored out of every reply path so the driver-enable
-// timing lives in one place (and to keep flash use down on the 16 KB part):
-//   txBegin  assert DE and let the driver settle before the start bit
-//   txEnd    hold DE for the final stop bit, release it, then drain the self-echo
-//   sendLine txBegin + one line + '\n' + txEnd (for the pre-assembled dumps)
+// Every reply is assembled in workBuf first and then sent in one burst by
+// sendReply(), so all formatting (and the dumps' EEPROM reads) happens before
+// the driver is enabled, and a reply to a checksummed frame can carry its
+// checksum in front (see CHECKSUMS in the header).  The framing lives in one
+// place:
+//   txBegin   assert DE and let the driver settle before the start bit
+//   txEnd     hold DE for the final stop bit, release it, then drain the self-echo
+//   sendReply [~HHHH] + workBuf[0..n) + '\n' between txBegin and txEnd
 //
 // Carrier sense, shared by the advertisement and the staggered broadcast
 // replies: true when nothing is waiting in the receive ring and no byte has been
@@ -1089,53 +1156,23 @@ void txEnd() {
   if (ovf) rxOverflows++;
   if (ovf || rxCut) { rxCut = 0; rxDiscard = true; }
 }
-void sendLine(const char *s) {
-  txBegin();
-  rs485.print(s);
-  rs485.print("\n");
-  txEnd();
-}
-// Common opening of a streamed reply: enable the driver and emit "m<id><tag>".
-void txReplyHeader(const char *tag);    // defined after printModuleId below
-void txNumField(long v);
-
-// Print module ID in outbound messages.
-// IDs 0-99: always two chars with leading zero, matching v6 format.
-// IDs 100-254: three chars (v7+ controllers expect this).
-void printModuleId() {
-  if (moduleId < 10)       rs485.print("0");
-  // (for IDs 10-99 no padding needed; for 100+ no padding needed either)
-  rs485.print(moduleId);
-}
-
-void txReplyHeader(const char *tag) {
-  txBegin();
-  rs485.print("m");
-  printModuleId();
-  rs485.print(tag);
-}
-// Emit one ":<value>" field of a colon-delimited reply (the dominant pattern in
-// the v/T/Q/M/P replies); factored to keep flash down.
-void txNumField(long v) {
-  rs485.print(":");
-  rs485.print(v);
-}
-
-// The dumps are the firmware's only formatted output, and they only ever need
-// decimal integers and plain strings, so these two replace snprintf() — and with
-// it the ~1 KB printf library and the build flags that picked its minimal
-// variant (see platformio.ini).  Both write at buf[n] and return the new offset;
-// the static_asserts next to workBuf prove a dump never outgrows the buffer.
+// Output is only ever decimal integers and plain strings, so these two format
+// it instead of printf — which kept the ~1 KB printf library and the build flags
+// that picked its minimal variant out of the build (see platformio.ini).  Both
+// write at buf[n] and return the new offset; the static_asserts next to workBuf
+// prove a dump never outgrows the buffer, and every other reply is far shorter.
 //
-// appendNum: v in decimal ("%d" / "%u"), then sep unless it is '\0'.  Every
-// value dumped is an int or an unsigned, so |v| <= 65535 and 16-bit arithmetic
-// is exact (and quicker than long division on this core).
+// appendNum: v in decimal, exactly as Print or "%ld" would write it, then sep
+// unless it is '\0'.  Magnitudes above 65535 take the long-division path; the
+// dumps' numbers never do, so a full map still formats in a few milliseconds.
 int appendNum(char *buf, int n, long v, char sep = '\0') {
-  if (v < 0) { buf[n++] = '-'; v = -v; }
-  char digits[5];                         // 65535 is the widest magnitude
+  unsigned long u = (unsigned long)v;
+  if (v < 0) { buf[n++] = '-'; u = 0UL - u; }
+  char digits[10];                        // 4294967295 is the widest magnitude
   uint8_t k = 0;
-  uint16_t u = (uint16_t)v;
-  do { digits[k++] = '0' + u % 10; u /= 10; } while (u);
+  while (u > 0xFFFFUL) { digits[k++] = '0' + u % 10; u /= 10; }
+  uint16_t w = (uint16_t)u;
+  do { digits[k++] = '0' + w % 10; w /= 10; } while (w);
   while (k) buf[n++] = digits[--k];
   if (sep) buf[n++] = sep;
   return n;
@@ -1143,6 +1180,52 @@ int appendNum(char *buf, int n, long v, char sep = '\0') {
 int appendStr(char *buf, int n, const char *s) {
   while (*s) buf[n++] = *s++;
   return n;
+}
+
+// Write the "m<id>" prefix (zero-padded to 2 digits for IDs 0-9, like the v6
+// wire format) into buf at offset n; returns the new offset.  Every reply except
+// mXack opens with it.
+int appendMsgId(char *buf, int n) {
+  buf[n++] = 'm';
+  if (moduleId < 10) buf[n++] = '0';
+  return appendNum(buf, n, moduleId);
+}
+
+// Start a reply in workBuf with "m<id><tag>"; returns the offset after it.
+int replyHead(const char *tag) {
+  return appendStr(workBuf, appendMsgId(workBuf, 0), tag);
+}
+
+// CRC-16/CCITT-FALSE: polynomial 0x1021, initial value 0xFFFF, no reflection,
+// no final XOR.  "123456789" gives 0x29B1; in Python, binascii.crc_hqx(b, 0xFFFF).
+uint16_t crc16(const char *p, int n) {
+  uint16_t crc = 0xFFFF;
+  while (n-- > 0) {
+    crc ^= (uint16_t)((uint8_t)*p++) << 8;
+    for (uint8_t b = 0; b < 8; b++)
+      crc = (crc & 0x8000) ? (uint16_t)((crc << 1) ^ 0x1021) : (uint16_t)(crc << 1);
+  }
+  return crc;
+}
+
+// Send workBuf[0..n) as one line.  With replyCrc set it is prefixed by "~HHHH":
+// the checksum of exactly those n bytes, as four upper-case hex digits.  The
+// checksum is worked out before the driver is enabled.
+void sendReply(int n) {
+  char pre[5];
+  if (replyCrc) {
+    uint16_t crc = crc16(workBuf, n);
+    pre[0] = '~';
+    for (uint8_t i = 4; i > 0; i--, crc >>= 4) {
+      uint8_t d = crc & 0x0F;
+      pre[i] = d < 10 ? '0' + d : 'A' + d - 10;
+    }
+  }
+  txBegin();
+  if (replyCrc) rs485.write((const uint8_t *)pre, 5);
+  rs485.write((const uint8_t *)workBuf, n);
+  rs485.write('\n');
+  txEnd();
 }
 
 // Append the calibrated flap map ("<idx>=<pos>,..." for the ACTIVE flaps with a
@@ -1161,15 +1244,6 @@ int appendFlapMap(char *buf, int n) {
     first = false;
   }
   return n;
-}
-
-// Write the "m<id>" prefix (zero-padded to 2 digits for IDs 0-9, like the v6
-// wire format) into buf at offset n; returns the new offset.  Shared by the
-// 'd' and 'A' dump assembly.
-int appendMsgId(char *buf, int n) {
-  buf[n++] = 'm';
-  if (moduleId < 10) buf[n++] = '0';
-  return appendNum(buf, n, moduleId);
 }
 
 // Dump EEPROM configuration over RS-485 as a SINGLE line:
@@ -1203,10 +1277,8 @@ void dumpEeprom() {
   // ── Map entries: <idx>=<pos>,<idx>=<pos>,... ─────────────────────────
   n = appendFlapMap(buf, n);
 
-  buf[n] = '\0';
-
   // ── Transmit the assembled line in one burst ─────────────────────────
-  sendLine(buf);
+  sendReply(n);
 }
 
 // ==========================================
@@ -1276,10 +1348,8 @@ void dumpAll() {
     buf[n++] = ch;
   }
 
-  buf[n] = '\0';
-
   // ── Transmit in one burst ────────────────────────────────────────────
-  sendLine(buf);
+  sendReply(n);
 }
 
 // ==========================================
@@ -1325,13 +1395,11 @@ void resetProvisioning() {
 // Called by loop() after the deferred reply timer fires — never called
 // directly from the parser so there are no blocking delays in the RX path.
 void sendVersionResponse() {
-  txReplyHeader("v:");
-  rs485.print(FIRMWARE_VERSION);
-  txNumField(moduleId);
-  rs485.print(":");
-  rs485.print(serialStr);
-  rs485.print("\n");
-  txEnd();
+  int n = replyHead("v:");
+  n = appendStr(workBuf, n, FIRMWARE_VERSION);
+  workBuf[n++] = ':';
+  n = appendNum(workBuf, n, moduleId, ':');
+  sendReply(appendStr(workBuf, n, serialStr));
 }
 
 // ==========================================
@@ -1630,10 +1698,7 @@ void calibrateModule() {
   // Response format matches v6: m<2-char-id>:<steps>\n for IDs 0-99.
   // On a rejected measurement we still report the raw count so the controller
   // can see something went wrong.
-  txReplyHeader(":");
-  rs485.print(measuredSteps);
-  rs485.print("\n");
-  txEnd();
+  sendReply(appendNum(workBuf, replyHead(":"), measuredSteps));
 
   if (valid) {
     totalStepsPerRev = (int)measuredSteps;
@@ -1738,13 +1803,11 @@ void hallSelfTest() {
   // risingEdges == fallingEdges == 1.  A mismatch (e.g. 1 rising, 0 falling)
   // indicates the active region straddles the revolution boundary or the sensor
   // releases raggedly.  Old parsers ignore the trailing field.
-  txReplyHeader("T:");
-  rs485.print(code);
-  txNumField(risingEdges);
-  txNumField(activeSamples);
-  txNumField(fallingEdges);
-  rs485.print("\n");
-  txEnd();
+  int n = replyHead("T:");
+  n = appendNum(workBuf, n, code, ':');
+  n = appendNum(workBuf, n, risingEdges, ':');
+  n = appendNum(workBuf, n, activeSamples, ':');
+  sendReply(appendNum(workBuf, n, fallingEdges));
 
   // Leave the module in a known state.
   homeModule();
@@ -1768,25 +1831,24 @@ void hallSelfTest() {
 // sagging below ~4.5 V under load, eepromOk == 0, or a climbing bootCount that
 // indicates the module is silently resetting in the field.
 //   --- appended in v33 (old parsers ignore) ---------------------------------
-//     rxOverflows, bcastSent, bcastLate   bus counters since boot; see their
-//                 declaration.  An idle module drains the ring as fast as the bus
-//                 can fill it, so rxOverflows should only move while the module
-//                 is busy (moving, self-testing, writing EEPROM).
+//     rxOverflows, bcastSent, bcastLate, crcErrors   bus counters since boot;
+//                 see their declaration.  An idle module drains the ring as
+//                 fast as the bus can fill it, so rxOverflows should only move
+//                 while the module is busy (moving, self-testing, writing EEPROM).
 void reportDiagnostics() {
   uint16_t vcc = readVccMillivolts();
   uint8_t  eeOk = eepromHealthOk() ? 1 : 0;
 
-  txReplyHeader("Q:");
-  rs485.print(resetCause);
-  txNumField(bootCount);
-  txNumField(vcc);
-  txNumField(eeOk);
-  txNumField(currentFlapIndex);
-  txNumField(rxOverflows);
-  txNumField(bcastSent);
-  txNumField(bcastLate);
-  rs485.print("\n");
-  txEnd();
+  int n = replyHead("Q:");
+  n = appendNum(workBuf, n, resetCause, ':');
+  n = appendNum(workBuf, n, bootCount, ':');
+  n = appendNum(workBuf, n, vcc, ':');
+  n = appendNum(workBuf, n, eeOk, ':');
+  n = appendNum(workBuf, n, currentFlapIndex, ':');
+  n = appendNum(workBuf, n, rxOverflows, ':');
+  n = appendNum(workBuf, n, bcastSent, ':');
+  n = appendNum(workBuf, n, bcastLate, ':');
+  sendReply(appendNum(workBuf, n, crcErrors));
 }
 
 // ==========================================
@@ -1946,21 +2008,17 @@ void mechanicalTest(int requestedRevs) {
   //                     intermittent single glitch from a progressive drift that
   //                     min/max/spread alone cannot.  Empty on a no-motion result.
   //                     Parsers should split on ',' rather than assume a count.
-  txReplyHeader("M:");
-  rs485.print(code);
-  txNumField(mn);
-  txNumField(mx);
-  txNumField(spreadTenthsPct);
-  txNumField(gateActive);
-  txNumField(gateSpan);
-  txNumField(avgMagnetWidth);
-  rs485.print(":");
-  for (int r = 0; r < nRevs; r++) {
-    if (r > 0) rs485.print(",");
-    rs485.print(revs[r]);
-  }
-  rs485.print("\n");
-  txEnd();
+  int n = replyHead("M:");
+  n = appendNum(workBuf, n, code, ':');
+  n = appendNum(workBuf, n, mn, ':');
+  n = appendNum(workBuf, n, mx, ':');
+  n = appendNum(workBuf, n, spreadTenthsPct, ':');
+  n = appendNum(workBuf, n, gateActive, ':');
+  n = appendNum(workBuf, n, gateSpan, ':');
+  n = appendNum(workBuf, n, avgMagnetWidth, ':');
+  for (int r = 0; r < nRevs; r++)
+    n = appendNum(workBuf, n, revs[r], (r + 1 < nRevs) ? ',' : '\0');
+  sendReply(n);
 
   homeModule();
   saveState();
@@ -2193,6 +2251,480 @@ void setup() {
 // parseState 24 : direct 'N' — flap config: <count> ':' <chars>
 // parseState 25 : 'N' prov — serial number ':' <count> ':' <chars> (config by SN)
 
+// One received byte through the command parser (the state list above).
+void parseByte(char c) {
+  switch (parseState) {
+
+    // ── State 0: wait for 'm' ──────────────────────────────────────────
+    case 0:
+      if (c == 'm') {
+        bufClear(idBuf, idLen); idWildcard = false; idProvision = false;
+        parseState = 1;
+      }
+      break;
+
+    // ── State 1: accumulate address, then dispatch ─────────────────────
+    // Accepts any mix of digits, '*', and 'X'.  Leading zeros are fine
+    // ("05" → 5).  The digit accumulator is length-capped (IDBUF_MAX) so a
+    // flood of digits can't grow a buffer without bound.
+    case 1:
+      if      (c == '*')      { idWildcard  = true; }
+      else if (c == 'X')      { idProvision = true; }
+      else if (isDigit(c))    { if (!idWildcard && !idProvision) bufAppend(idBuf, idLen, IDBUF_MAX, c); }
+      else {
+        // c is the command letter.
+        bool match = idWildcard ||
+                     (idLen > 0 && (uint8_t)bufToLong(idBuf, idLen) == moduleId);
+
+        // Pause advertisements briefly on ANY broadcast so an unprovisioned
+        // module doesn't talk over an in-progress m*v reply sweep.
+        if (idWildcard) suppressAdvUntil = millis() + 30000UL;
+
+        if (idProvision) {
+          // Provisioning commands: every module listens, SN check is inside.
+          // H/D/A/T/Q/M/F take no parameter and share state 13 (collect SN,
+          // then run the action selected by provCmd).  I/W/N carry extra
+          // fields and have their own states.
+          if (c=='H'||c=='D'||c=='A'||c=='T'||c=='Q'||c=='M'||c=='F') {
+                                bufClear(snBuf, snLen); provCmd = c;
+                                parseState = 13; }
+          else if (c == 'I') { bufClear(snBuf, snLen); snColonSeen = false; bufClear(numBuf, numLen);
+                                parseState = 14; }
+          else if (c == 'W') { bufClear(snBuf, snLen); snColonSeen = false; restoreLen = 0; restoreBuf[0] = '\0';
+                                parseState = 17; }
+          else if (c == 'N') { bufClear(snBuf, snLen); bufClear(numBuf, numLen);
+                                restoreLen = 0; restoreBuf[0] = '\0'; tempIndex = 0;
+                                parseState = 25; }
+          else                 parseState = 0;
+
+        } else if (match) {
+          // Normal addressed / broadcast commands
+          switch (c) {
+            case '-': parseState = 4; break;
+            case '+': bufClear(numBuf, numLen); parseState = 12; break;
+            case 'h': homeModule(); saveState(); parseState = 0; break;
+            case 'c': calibrateModule();          parseState = 0; break;
+            case 'T':
+              // Hall sensor self-test.  Long, motor-driven operation, so it's
+              // direct-addressed only and synchronous (like 'd'/'A'/'c');
+              // broadcast m*T is ignored.
+              if (!idWildcard) {
+                hallSelfTest();
+              }
+              parseState = 0;
+              break;
+            case 'P':
+              // Re-detect Hall sensor polarity (drives one revolution) and
+              // report it.  Direct-addressed only.  Reply:
+              //   m<id>P:<code>:<level>\n
+              //     code  0 = detected OK, 1 = no magnet seen (kept old level)
+              //     level 0 = active LOW, 1 = active HIGH (the level now in use)
+              if (!idWildcard) {
+                uint8_t pcode = 0;
+                if (detectHallPolarity()) { saveHallActive(); pcode = 0; }
+                else                      { pcode = 1; }
+                int n = replyHead("P:");
+                n = appendNum(workBuf, n, pcode, ':');
+                sendReply(appendNum(workBuf, n, hallActiveLevel == HIGH ? 1 : 0));
+                homeModule();   // re-home now that polarity may have changed
+              }
+              parseState = 0;
+              break;
+            case 'Q':
+              // Diagnostics snapshot (reset cause, boot count, VCC, EEPROM
+              // health, current index).  Instantaneous read, no movement.
+              // Direct-addressed only; broadcast m*Q is ignored.
+              if (!idWildcard) {
+                reportDiagnostics();
+              }
+              parseState = 0;
+              break;
+            case 'M':
+              // Mechanical self-test (missed-step / no-motion detection).
+              // Long, motor-driven; direct-addressed only and synchronous.
+              // Accepts an OPTIONAL revolution count: m<id>M<n> (n clamped to
+              // [MECH_TEST_REVS_MIN, MECH_TEST_REVS_MAX]); bare m<id>M uses the
+              // default.  Collect any digits in state 23, then run on terminator.
+              if (!idWildcard) {
+                bufClear(numBuf, numLen);
+                parseState = 23;
+              } else {
+                parseState = 0;
+              }
+              break;
+            case 'o': bufClear(numBuf, numLen); parseState = 5; break;
+            case 't': bufClear(numBuf, numLen); parseState = 6; break;
+            case 's': bufClear(numBuf, numLen); parseState = 7; break;
+            case 'g': bufClear(numBuf, numLen); parseState = 8; break;
+            case 'w': bufClear(numBuf, numLen); tempIndex = -1; parseState = 9; break;
+            case 'i': bufClear(numBuf, numLen); parseState = 10; break;
+            case 'a': bufClear(numBuf, numLen); parseState = 11; break;
+            case 'N':
+              // Configure the flap set: m<id>N<count>:<chars>
+              // Both parts optional (count before ':', chars after).  Applies
+              // to a direct ID or a broadcast m*N (whole panel at once); no
+              // reply.  Parsed in state 24.  numBuf collects the count digits;
+              // the chars accumulate into the shared work buffer (never in use
+              // for a restore at the same time); snColonSeen marks the ':'.
+              bufClear(numBuf, numLen);
+              restoreLen = 0; restoreBuf[0] = '\0';
+              snColonSeen = false;
+              parseState = 24;
+              break;
+            case 'd':
+              // Dumps answered ONLY when addressed directly, SYNCHRONOUSLY,
+              // exactly like mXD.  Broadcast dumps are ignored (too long to
+              // stagger across a reply slot).
+              if (!idWildcard) {
+                dumpEeprom();
+              }
+              parseState = 0;
+              break;
+            case 'A':
+              // Combined "all fields" dump (version + EEPROM in one message).
+              if (idWildcard) {
+                // Broadcast all-fields query — may carry an optional
+                // "<lo>-<hi>" range.  Collect it in state 18; replies are
+                // staggered via the deferred path using the wider 'A' slot.
+                // Because each 'A' frame is long (~570 ms), a full sweep is
+                // slow — prefer ranged batches (m*A<lo>-<hi>) for big buses.
+                bufClear(numBuf, numLen);
+                replyRangeLo = 0;
+                replyRangeHi = 254;
+                broadcastReplyType = REPLY_ALL;
+                parseState = 18;
+              } else {
+                // Direct query — reply SYNCHRONOUSLY and immediately, like mXD.
+                dumpAll();
+                parseState = 0;
+              }
+              break;
+            case 'R': resetProvisioning();                              parseState = 0; break;
+            case 'v':
+              if (idWildcard) {
+                // Broadcast version query — may carry an optional "<lo>-<hi>"
+                // range.  Collect it in state 18; broadcast replies are
+                // staggered via the deferred path.
+                bufClear(numBuf, numLen);
+                replyRangeLo = 0;
+                replyRangeHi = 254;
+                broadcastReplyType = REPLY_VERSION;
+                parseState = 18;
+              } else {
+                // Direct query — reply SYNCHRONOUSLY and immediately, like mXD.
+                sendVersionResponse();
+                parseState = 0;
+              }
+              break;
+            case 'F': resetEepromDefaults();                            parseState = 0; break;
+            case 'e':
+              clearFlapMap();
+              parseState = 0;
+              break;
+            default: parseState = 0; break;
+          }
+        } else {
+          parseState = 0;
+        }
+
+        bufClear(idBuf, idLen); idWildcard = false; idProvision = false;
+      }
+      break;
+
+    // ── State 4: '-' display character ────────────────────────────────
+    case 4:
+      moveToChar(c);
+      parseState = 0;
+      break;
+
+    // ── States 5-8: single-value numeric commands ──────────────────────
+    case 5:
+      if (isDigit(c)) { bufAppend(numBuf, numLen, NUMBUF_MAX, c); break; }
+      if (numLen > 0) { stepsFromHallToZero = (int)bufToLong(numBuf, numLen); saveHomeOffset(); }
+      parseState = 0; break;
+
+    case 6:
+      if (isDigit(c)) { bufAppend(numBuf, numLen, NUMBUF_MAX, c); break; }
+      if (numLen > 0) { totalStepsPerRev = (int)bufToLong(numBuf, numLen); saveTotalSteps(); }
+      parseState = 0; break;
+
+    case 7:
+      // Nudge: accept an optional leading '-' so negative offsets work
+      // (e.g. "m38s-16").  '-' is only valid as the first character.
+      if (c == '-' && numLen == 0) { bufAppend(numBuf, numLen, NUMBUF_MAX, c); break; }
+      if (isDigit(c)) { bufAppend(numBuf, numLen, NUMBUF_MAX, c); break; }
+      if (numLen > 0) {
+        int n = (int)bufToLong(numBuf, numLen);
+        nudge(n);
+      }
+      parseState = 0; break;
+
+    case 8:
+      if (isDigit(c)) { bufAppend(numBuf, numLen, NUMBUF_MAX, c); break; }
+      if (numLen > 0) gotoRawStep(bufToLong(numBuf, numLen));
+      parseState = 0; break;
+
+    // ── State 9: 'w' write flap map entry ─────────────────────────────
+    case 9:
+      if (c == ':')        { tempIndex = (int)bufToLong(numBuf, numLen); bufClear(numBuf, numLen); }
+      else if (isDigit(c)) { bufAppend(numBuf, numLen, NUMBUF_MAX, c); }
+      else {
+        if (numLen > 0) writeFlapPos(tempIndex, bufToLong(numBuf, numLen), flapCount);
+        parseState = 0;
+      }
+      break;
+
+    // ── State 10: 'i' set ID ───────────────────────────────────────────
+    case 10:
+      if (isDigit(c)) { bufAppend(numBuf, numLen, NUMBUF_MAX, c); break; }
+      if (numLen > 0) {
+        moduleId = (uint8_t)bufToLong(numBuf, numLen);
+        eepromUpdateByte(ADDR_MODULE_ID, moduleId);
+      }
+      parseState = 0; break;
+
+    // ── State 11: 'a' auto-home flag ──────────────────────────────────
+    case 11:
+      if (isDigit(c)) { bufAppend(numBuf, numLen, NUMBUF_MAX, c); break; }
+      if (numLen > 0) {
+        autoHomeEnabled = (bufToLong(numBuf, numLen) == 1);
+        eepromUpdateByte(ADDR_AUTO_HOME, autoHomeEnabled ? 1 : 0);
+        saveState();
+      }
+      parseState = 0; break;
+
+    // ── State 12: '+' flap by index (v7+) ─────────────────────────────
+    case 12:
+      if (isDigit(c)) { bufAppend(numBuf, numLen, NUMBUF_MAX, c); break; }
+      if (numLen > 0) moveToIndex((int)bufToLong(numBuf, numLen));
+      parseState = 0; break;
+
+    // ── State 13: parameterless provisioning-by-SN (H/D/A/T/Q/M/F) ────
+    // Collect the serial number, then — if it matches THIS module — run the
+    // action selected by provCmd.  Replies (D/A/T/Q/M) are sent synchronously
+    // from their handlers; only the matching module ever answers.
+    case 13:
+      if (c != '\n' && c != '\r') { bufAppend(snBuf, snLen, SNBUF_MAX, c); break; }
+      if (serialMatches(snBuf)) {
+        switch (provCmd) {
+          case 'H': homeModule(); saveState();        break;
+          case 'D': dumpEeprom();                     break;
+          case 'A': dumpAll();                        break;
+          case 'T': hallSelfTest();                   break;
+          case 'Q': reportDiagnostics();              break;
+          case 'M': mechanicalTest(MECH_TEST_REVS);   break;
+          case 'F': resetEepromDefaults();            break;
+        }
+      }
+      bufClear(snBuf, snLen); parseState = 0; break;
+
+    // ── State 14: 'I' assign ID by serial number ──────────────────────
+    case 14:
+      if (c == ':' && !snColonSeen) {
+        snColonSeen = true; bufClear(numBuf, numLen);
+      } else if (c != '\n' && c != '\r') {
+        if (!snColonSeen) bufAppend(snBuf, snLen, SNBUF_MAX, c);
+        else if (isDigit(c)) bufAppend(numBuf, numLen, NUMBUF_MAX, c);
+      } else {
+        if (snColonSeen && numLen > 0 && serialMatches(snBuf)) {
+          moduleId = (uint8_t)bufToLong(numBuf, numLen);
+          eepromUpdateByte(ADDR_MODULE_ID, moduleId);
+
+          delay(20);
+          int n = appendStr(workBuf, 0, "mXack:");
+          n = appendStr(workBuf, n, serialStr);
+          workBuf[n++] = ':';
+          sendReply(appendNum(workBuf, n, moduleId));
+        }
+        bufClear(snBuf, snLen); snColonSeen = false; bufClear(numBuf, numLen); parseState = 0;
+      }
+      break;
+
+    // ── State 23: optional revolution count for direct 'M' ────────────
+    // Reached after a direct (non-broadcast) 'm<id>M'.  Collects optional
+    // digits: bare 'm<id>M' → default count; 'm<id>M<n>' → n (clamped inside
+    // mechanicalTest to [MECH_TEST_REVS_MIN, MECH_TEST_REVS_MAX]).
+    case 23:
+      if (isDigit(c)) { bufAppend(numBuf, numLen, NUMBUF_MAX, c); break; }
+      // Terminator (\n, \r, or anything else): run with the parsed count, or
+      // the default if no digits were supplied.
+      mechanicalTest(numLen > 0 ? (int)bufToLong(numBuf, numLen) : MECH_TEST_REVS);
+      bufClear(numBuf, numLen);
+      parseState = 0;
+      break;
+
+    // ── State 17: 'W' restore EEPROM by serial number ─────────────────
+    // Format:  mXW<serialNumber>:<homeOffset>:<totalSteps>:<idx>=<pos>,...\n
+    //
+    //   snBuf       accumulates the 20-char serial number
+    //   restoreBuf  accumulates everything after the first ':' (length-capped)
+    //
+    // Module ID and magic byte are always preserved; all other calibration
+    // fields and the flap map are overwritten with the supplied values.
+    case 17:
+      if (c == ':' && !snColonSeen) {
+        // First colon — switch from accumulating SN to accumulating payload
+        snColonSeen = true;
+      } else if (c != '\n' && c != '\r') {
+        if (!snColonSeen) bufAppend(snBuf, snLen, SNBUF_MAX, c);
+        else              bufAppend(restoreBuf, restoreLen, RESTORE_MAX, c);
+      } else {
+        // Terminator — act if this module matches
+        if (snColonSeen && serialMatches(snBuf)) {
+          restoreEepromFromPayload(restoreBuf);
+        }
+        bufClear(snBuf, snLen); snColonSeen = false;
+        restoreLen = 0; restoreBuf[0] = '\0'; parseState = 0;
+      }
+      break;
+
+    // ── State 18: optional range for a broadcast version/all query ─────
+    // Reached after "m*v" or "m*A".  Accepts an optional "<lo>-<hi>" range:
+    //   m*v\n / m*A\n   → whole bus   (replyRangeLo=0,  replyRangeHi=254)
+    //   m*v0-49\n       → IDs 0–49 only
+    //   m*A50-99\n      → IDs 50–99 only
+    //
+    // broadcastReplyType (set on entry) selects whether matching modules
+    // reply with a version frame or a combined all-fields dump.
+    // numBuf accumulates the low number until '-', then the high number.
+    // snColonSeen is reused here as a "seen the dash" flag.
+    case 18:
+      if (isDigit(c)) {
+        bufAppend(numBuf, numLen, NUMBUF_MAX, c);
+      } else if (c == '-') {
+        // Low bound complete; start collecting high bound.
+        replyRangeLo = (int)bufToLong(numBuf, numLen);
+        bufClear(numBuf, numLen);
+        snColonSeen = true;  // reused: marks that we've passed the dash
+      } else {
+        // Terminator (\n, \r, or anything else) — finalise and schedule.
+        if (snColonSeen) {
+          if (numLen > 0) replyRangeHi = (int)bufToLong(numBuf, numLen);
+        } else {
+          if (numLen > 0) {
+            replyRangeLo = (int)bufToLong(numBuf, numLen);
+            replyRangeHi = replyRangeLo;
+          }
+        }
+        schedulePendingReply(broadcastReplyType, true);
+        bufClear(numBuf, numLen); snColonSeen = false; parseState = 0;
+      }
+      break;
+
+    // ── State 24: 'N' configure flap count + char set ─────────────────
+    // Form: m<id>N<count>:<chars>   (count and chars both optional)
+    //   - before the FIRST ':' → digits accumulate as the flap count
+    //   - after  the FIRST ':' → every byte (incl. further ':') is a flap
+    //     char, taken verbatim until the terminator
+    // Applied on '\n'/'\r' (or after 50 ms idle, which feeds a '\n').  No reply.
+    case 24:
+      if (!snColonSeen) {
+        if (c == ':')             { snColonSeen = true; }          // → chars
+        else if (isDigit(c))      { bufAppend(numBuf, numLen, NUMBUF_MAX, c); }
+        else if (c == '\n' || c == '\r') {
+          applyFlapConfig();
+          bufClear(numBuf, numLen); restoreLen = 0; restoreBuf[0] = '\0';
+          snColonSeen = false; parseState = 0;
+        }
+        // any other char before ':' is ignored (malformed count)
+      } else {
+        if (c == '\n' || c == '\r') {
+          applyFlapConfig();
+          bufClear(numBuf, numLen); restoreLen = 0; restoreBuf[0] = '\0';
+          snColonSeen = false; parseState = 0;
+        } else if (restoreLen < MAX_FLAPS) {
+          restoreBuf[restoreLen++] = c;     // accumulate the char set verbatim
+          restoreBuf[restoreLen]   = '\0';
+        }
+        // chars beyond MAX_FLAPS are dropped (buffer full)
+      }
+      break;
+
+    // ── State 25: 'N' configure flap set by serial number ─────────────
+    // Form: mXN<serialNumber>:<count>:<chars>   (count and chars optional)
+    // tempIndex tracks the field: 0 = serial number, 1 = count, 2 = chars.
+    // Only the module whose serial matches applies the change.  Like the
+    // direct 'N', the chars field is taken verbatim and may contain ':'.
+    case 25:
+      if (tempIndex == 0) {                       // serial number
+        if (c == ':')                        tempIndex = 1;
+        else if (c != '\n' && c != '\r')     bufAppend(snBuf, snLen, SNBUF_MAX, c);
+        else { bufClear(snBuf, snLen); parseState = 0; }   // no colon → abort
+      } else if (tempIndex == 1) {                // count
+        if (c == ':')                        tempIndex = 2;
+        else if (isDigit(c))                 bufAppend(numBuf, numLen, NUMBUF_MAX, c);
+        else if (c == '\n' || c == '\r') {
+          if (serialMatches(snBuf)) applyFlapConfig();
+          bufClear(snBuf, snLen); bufClear(numBuf, numLen); parseState = 0;
+        }
+      } else {                                    // chars (verbatim)
+        if (c == '\n' || c == '\r') {
+          if (serialMatches(snBuf)) applyFlapConfig();
+          bufClear(snBuf, snLen); bufClear(numBuf, numLen);
+          restoreLen = 0; restoreBuf[0] = '\0'; parseState = 0;
+        } else if (restoreLen < MAX_FLAPS) {
+          restoreBuf[restoreLen++] = c;
+          restoreBuf[restoreLen]   = '\0';
+        }
+      }
+      break;
+
+  }  // end switch(parseState)
+}
+
+// ── Checksummed frames (see CHECKSUMS in the header) ─────────────────────────
+// loop() collects a frame that starts with '~' into workBuf, whole, until its
+// terminator (or 50 ms of silence); nothing in it reaches the parser before its
+// checksum has been checked.
+
+// The parser's address rule (state 1) applied to a buffered frame "m<addr>...":
+// true if it is for this module — its ID, a broadcast, or the serial-number
+// address X (whose serial the parser then checks).  The ID is accumulated
+// modulo 256 like the parser's (uint8_t) cast.
+bool addressedHere(const char *f, int len) {
+  uint8_t id = 0, digits = 0;
+  bool any = false;
+  for (int i = 1; i < len; i++) {
+    char c = f[i];
+    if (c == '*' || c == 'X') any = true;
+    else if (isDigit(c)) {
+      if (!any && digits < IDBUF_MAX) { id = id * 10 + (c - '0'); digits++; }
+    } else break;
+  }
+  return any || (digits > 0 && id == moduleId);
+}
+
+// workBuf[0..crcLen) holds "~HHHH<frame>".  A frame for another module is
+// dropped unchecked, like any frame not addressed here.  One for this module
+// runs only if its checksum matches: its bytes go through the parser exactly as
+// if they had arrived plain, with replyCrc set so every reply it causes is
+// checksummed too.  A damaged one (non-hex checksum, mismatch, or too long for
+// the buffer) is dropped and counted in crcErrors.  One command per frame: the
+// replay stops as soon as the command has run, because its reply may already
+// have reused workBuf.
+void runCrcFrame() {
+  int len = crcLen;
+  crcLen = 0;
+  if (len < 7 || workBuf[5] != 'm' || !addressedHere(workBuf + 5, len - 5)) return;
+  bool ok = len < DUMP_BUF_SIZE;           // not cut short by the buffer
+  uint16_t want = 0;
+  for (uint8_t i = 1; i < 5; i++) {
+    uint8_t h = (uint8_t)workBuf[i], d;
+    if (h >= '0' && h <= '9')        d = h - '0';
+    else if ((h | 0x20) >= 'a' && (h | 0x20) <= 'f') d = (h | 0x20) - 'a' + 10;
+    else { d = 0; ok = false; }
+    want = (uint16_t)((want << 4) | d);
+  }
+  if (!ok || crc16(workBuf + 5, len - 5) != want) { crcErrors++; return; }
+  replyCrc = true;
+  for (int i = 5; i < len; i++) {
+    parseByte(workBuf[i]);
+    if (parseState == 0) break;            // the command ran
+  }
+  if (parseState != 0) parseByte('\n');    // the frame's terminator
+  replyCrc = false;
+}
+
 void loop() {
   wdt_reset();   // service the watchdog every iteration
 
@@ -2209,11 +2741,15 @@ void loop() {
   // while another frame is still on the wire (a late or busy neighbour, a
   // controller that moved on) waits for CSMA_LISTEN_MS of quiet instead of
   // destroying both frames.  An on-time slot always sees that much quiet.
-  if (pendingReply != REPLY_NONE && parseState == 0 &&
+  // Not while a checksummed frame is being collected either: it is in workBuf.
+  // The reply is checksummed if the broadcast that scheduled it was.
+  if (pendingReply != REPLY_NONE && parseState == 0 && crcLen == 0 &&
       (long)(millis() - pendingReplyTime) >= 0 && busQuiet()) {
     if ((long)(millis() - pendingReplyTime) > 1) bcastLate++;   // held past its slot
+    replyCrc = pendingCrc;
     if      (pendingReply == REPLY_VERSION) sendVersionResponse();
     else if (pendingReply == REPLY_ALL)     dumpAll();
+    replyCrc = false;
     pendingReply = REPLY_NONE;
     bcastSent++;
   }
@@ -2266,445 +2802,38 @@ void loop() {
       cut = (rxCut && --rxCut == 0);       // c is the last byte before the gap
 
       if (rxDiscard) {                     // skipping a spliced tail
-        if (c == '\n' || c == '\r') rxDiscard = false;
-        if (cut) rxDiscard = true;         // ...but the gap follows: keep skipping
-        continue;
+        if (c != '~') {
+          if (c == '\n' || c == '\r') rxDiscard = false;
+          if (cut) rxDiscard = true;       // ...but the gap follows: keep skipping
+          continue;
+        }
+        // A checksummed frame needs no skip: a splice cannot pass its check.
+        rxDiscard = false;
       }
     } else if (millis() - lastSerialTime > 50 &&
-               ((parseState >= 5 && parseState <= 12) || parseState == 18 ||
-                parseState == 23 || parseState == 24)) {
+               (crcLen || (parseState >= 5 && parseState <= 12) ||
+                parseState == 18 || parseState == 23 || parseState == 24)) {
       // ── Idle timeout: end a frame that came without a terminator ───────
       // The numeric commands (5-12), the broadcast range (18), the 'M' count
-      // (23) and the 'N' flap set (24) all act on their terminator.  Within a
-      // frame bytes arrive ~1 ms apart, so 50 ms of silence means the frame
-      // truly ended: run exactly the terminator path, as if '\n' had arrived.
-      // (Before v33 each of these was a hand-copied twin of its handler.)
+      // (23) and the 'N' flap set (24) all act on their terminator, and so is
+      // a checksummed frame checked on its terminator.  Within a frame bytes
+      // arrive ~1 ms apart, so 50 ms of silence means the frame truly ended:
+      // run exactly the terminator path, as if '\n' had arrived.  (Before v33
+      // each of these was a hand-copied twin of its handler.)
       c = '\n';
     } else {
       break;
     }
 
-    switch (parseState) {
-
-      // ── State 0: wait for 'm' ──────────────────────────────────────────
-      case 0:
-        if (c == 'm') {
-          bufClear(idBuf, idLen); idWildcard = false; idProvision = false;
-          parseState = 1;
-        }
-        break;
-
-      // ── State 1: accumulate address, then dispatch ─────────────────────
-      // Accepts any mix of digits, '*', and 'X'.  Leading zeros are fine
-      // ("05" → 5).  The digit accumulator is length-capped (IDBUF_MAX) so a
-      // flood of digits can't grow a buffer without bound.
-      case 1:
-        if      (c == '*')      { idWildcard  = true; }
-        else if (c == 'X')      { idProvision = true; }
-        else if (isDigit(c))    { if (!idWildcard && !idProvision) bufAppend(idBuf, idLen, IDBUF_MAX, c); }
-        else {
-          // c is the command letter.
-          bool match = idWildcard ||
-                       (idLen > 0 && (uint8_t)bufToLong(idBuf, idLen) == moduleId);
-
-          // Pause advertisements briefly on ANY broadcast so an unprovisioned
-          // module doesn't talk over an in-progress m*v reply sweep.
-          if (idWildcard) suppressAdvUntil = millis() + 30000UL;
-
-          if (idProvision) {
-            // Provisioning commands: every module listens, SN check is inside.
-            // H/D/A/T/Q/M/F take no parameter and share state 13 (collect SN,
-            // then run the action selected by provCmd).  I/W/N carry extra
-            // fields and have their own states.
-            if (c=='H'||c=='D'||c=='A'||c=='T'||c=='Q'||c=='M'||c=='F') {
-                                  bufClear(snBuf, snLen); provCmd = c;
-                                  parseState = 13; }
-            else if (c == 'I') { bufClear(snBuf, snLen); snColonSeen = false; bufClear(numBuf, numLen);
-                                  parseState = 14; }
-            else if (c == 'W') { bufClear(snBuf, snLen); snColonSeen = false; restoreLen = 0; restoreBuf[0] = '\0';
-                                  parseState = 17; }
-            else if (c == 'N') { bufClear(snBuf, snLen); bufClear(numBuf, numLen);
-                                  restoreLen = 0; restoreBuf[0] = '\0'; tempIndex = 0;
-                                  parseState = 25; }
-            else                 parseState = 0;
-
-          } else if (match) {
-            // Normal addressed / broadcast commands
-            switch (c) {
-              case '-': parseState = 4; break;
-              case '+': bufClear(numBuf, numLen); parseState = 12; break;
-              case 'h': homeModule(); saveState(); parseState = 0; break;
-              case 'c': calibrateModule();          parseState = 0; break;
-              case 'T':
-                // Hall sensor self-test.  Long, motor-driven operation, so it's
-                // direct-addressed only and synchronous (like 'd'/'A'/'c');
-                // broadcast m*T is ignored.
-                if (!idWildcard) {
-                  hallSelfTest();
-                }
-                parseState = 0;
-                break;
-              case 'P':
-                // Re-detect Hall sensor polarity (drives one revolution) and
-                // report it.  Direct-addressed only.  Reply:
-                //   m<id>P:<code>:<level>\n
-                //     code  0 = detected OK, 1 = no magnet seen (kept old level)
-                //     level 0 = active LOW, 1 = active HIGH (the level now in use)
-                if (!idWildcard) {
-                  uint8_t pcode = 0;
-                  if (detectHallPolarity()) { saveHallActive(); pcode = 0; }
-                  else                      { pcode = 1; }
-                  txReplyHeader("P:");
-                  rs485.print(pcode);
-                  txNumField(hallActiveLevel == HIGH ? 1 : 0);
-                  rs485.print("\n");
-                  txEnd();
-                  homeModule();   // re-home now that polarity may have changed
-                }
-                parseState = 0;
-                break;
-              case 'Q':
-                // Diagnostics snapshot (reset cause, boot count, VCC, EEPROM
-                // health, current index).  Instantaneous read, no movement.
-                // Direct-addressed only; broadcast m*Q is ignored.
-                if (!idWildcard) {
-                  reportDiagnostics();
-                }
-                parseState = 0;
-                break;
-              case 'M':
-                // Mechanical self-test (missed-step / no-motion detection).
-                // Long, motor-driven; direct-addressed only and synchronous.
-                // Accepts an OPTIONAL revolution count: m<id>M<n> (n clamped to
-                // [MECH_TEST_REVS_MIN, MECH_TEST_REVS_MAX]); bare m<id>M uses the
-                // default.  Collect any digits in state 23, then run on terminator.
-                if (!idWildcard) {
-                  bufClear(numBuf, numLen);
-                  parseState = 23;
-                } else {
-                  parseState = 0;
-                }
-                break;
-              case 'o': bufClear(numBuf, numLen); parseState = 5; break;
-              case 't': bufClear(numBuf, numLen); parseState = 6; break;
-              case 's': bufClear(numBuf, numLen); parseState = 7; break;
-              case 'g': bufClear(numBuf, numLen); parseState = 8; break;
-              case 'w': bufClear(numBuf, numLen); tempIndex = -1; parseState = 9; break;
-              case 'i': bufClear(numBuf, numLen); parseState = 10; break;
-              case 'a': bufClear(numBuf, numLen); parseState = 11; break;
-              case 'N':
-                // Configure the flap set: m<id>N<count>:<chars>
-                // Both parts optional (count before ':', chars after).  Applies
-                // to a direct ID or a broadcast m*N (whole panel at once); no
-                // reply.  Parsed in state 24.  numBuf collects the count digits;
-                // the chars accumulate into the shared work buffer (never in use
-                // for a restore at the same time); snColonSeen marks the ':'.
-                bufClear(numBuf, numLen);
-                restoreLen = 0; restoreBuf[0] = '\0';
-                snColonSeen = false;
-                parseState = 24;
-                break;
-              case 'd':
-                // Dumps answered ONLY when addressed directly, SYNCHRONOUSLY,
-                // exactly like mXD.  Broadcast dumps are ignored (too long to
-                // stagger across a reply slot).
-                if (!idWildcard) {
-                  dumpEeprom();
-                }
-                parseState = 0;
-                break;
-              case 'A':
-                // Combined "all fields" dump (version + EEPROM in one message).
-                if (idWildcard) {
-                  // Broadcast all-fields query — may carry an optional
-                  // "<lo>-<hi>" range.  Collect it in state 18; replies are
-                  // staggered via the deferred path using the wider 'A' slot.
-                  // Because each 'A' frame is long (~570 ms), a full sweep is
-                  // slow — prefer ranged batches (m*A<lo>-<hi>) for big buses.
-                  bufClear(numBuf, numLen);
-                  replyRangeLo = 0;
-                  replyRangeHi = 254;
-                  broadcastReplyType = REPLY_ALL;
-                  parseState = 18;
-                } else {
-                  // Direct query — reply SYNCHRONOUSLY and immediately, like mXD.
-                  dumpAll();
-                  parseState = 0;
-                }
-                break;
-              case 'R': resetProvisioning();                              parseState = 0; break;
-              case 'v':
-                if (idWildcard) {
-                  // Broadcast version query — may carry an optional "<lo>-<hi>"
-                  // range.  Collect it in state 18; broadcast replies are
-                  // staggered via the deferred path.
-                  bufClear(numBuf, numLen);
-                  replyRangeLo = 0;
-                  replyRangeHi = 254;
-                  broadcastReplyType = REPLY_VERSION;
-                  parseState = 18;
-                } else {
-                  // Direct query — reply SYNCHRONOUSLY and immediately, like mXD.
-                  sendVersionResponse();
-                  parseState = 0;
-                }
-                break;
-              case 'F': resetEepromDefaults();                            parseState = 0; break;
-              case 'e':
-                clearFlapMap();
-                parseState = 0;
-                break;
-              default: parseState = 0; break;
-            }
-          } else {
-            parseState = 0;
-          }
-
-          bufClear(idBuf, idLen); idWildcard = false; idProvision = false;
-        }
-        break;
-
-      // ── State 4: '-' display character ────────────────────────────────
-      case 4:
-        moveToChar(c);
-        parseState = 0;
-        break;
-
-      // ── States 5-8: single-value numeric commands ──────────────────────
-      case 5:
-        if (isDigit(c)) { bufAppend(numBuf, numLen, NUMBUF_MAX, c); break; }
-        if (numLen > 0) { stepsFromHallToZero = (int)bufToLong(numBuf, numLen); saveHomeOffset(); }
-        parseState = 0; break;
-
-      case 6:
-        if (isDigit(c)) { bufAppend(numBuf, numLen, NUMBUF_MAX, c); break; }
-        if (numLen > 0) { totalStepsPerRev = (int)bufToLong(numBuf, numLen); saveTotalSteps(); }
-        parseState = 0; break;
-
-      case 7:
-        // Nudge: accept an optional leading '-' so negative offsets work
-        // (e.g. "m38s-16").  '-' is only valid as the first character.
-        if (c == '-' && numLen == 0) { bufAppend(numBuf, numLen, NUMBUF_MAX, c); break; }
-        if (isDigit(c)) { bufAppend(numBuf, numLen, NUMBUF_MAX, c); break; }
-        if (numLen > 0) {
-          int n = (int)bufToLong(numBuf, numLen);
-          nudge(n);
-        }
-        parseState = 0; break;
-
-      case 8:
-        if (isDigit(c)) { bufAppend(numBuf, numLen, NUMBUF_MAX, c); break; }
-        if (numLen > 0) gotoRawStep(bufToLong(numBuf, numLen));
-        parseState = 0; break;
-
-      // ── State 9: 'w' write flap map entry ─────────────────────────────
-      case 9:
-        if (c == ':')        { tempIndex = (int)bufToLong(numBuf, numLen); bufClear(numBuf, numLen); }
-        else if (isDigit(c)) { bufAppend(numBuf, numLen, NUMBUF_MAX, c); }
-        else {
-          if (numLen > 0) writeFlapPos(tempIndex, bufToLong(numBuf, numLen), flapCount);
-          parseState = 0;
-        }
-        break;
-
-      // ── State 10: 'i' set ID ───────────────────────────────────────────
-      case 10:
-        if (isDigit(c)) { bufAppend(numBuf, numLen, NUMBUF_MAX, c); break; }
-        if (numLen > 0) {
-          moduleId = (uint8_t)bufToLong(numBuf, numLen);
-          eepromUpdateByte(ADDR_MODULE_ID, moduleId);
-        }
-        parseState = 0; break;
-
-      // ── State 11: 'a' auto-home flag ──────────────────────────────────
-      case 11:
-        if (isDigit(c)) { bufAppend(numBuf, numLen, NUMBUF_MAX, c); break; }
-        if (numLen > 0) {
-          autoHomeEnabled = (bufToLong(numBuf, numLen) == 1);
-          eepromUpdateByte(ADDR_AUTO_HOME, autoHomeEnabled ? 1 : 0);
-          saveState();
-        }
-        parseState = 0; break;
-
-      // ── State 12: '+' flap by index (v7+) ─────────────────────────────
-      case 12:
-        if (isDigit(c)) { bufAppend(numBuf, numLen, NUMBUF_MAX, c); break; }
-        if (numLen > 0) moveToIndex((int)bufToLong(numBuf, numLen));
-        parseState = 0; break;
-
-      // ── State 13: parameterless provisioning-by-SN (H/D/A/T/Q/M/F) ────
-      // Collect the serial number, then — if it matches THIS module — run the
-      // action selected by provCmd.  Replies (D/A/T/Q/M) are sent synchronously
-      // from their handlers; only the matching module ever answers.
-      case 13:
-        if (c != '\n' && c != '\r') { bufAppend(snBuf, snLen, SNBUF_MAX, c); break; }
-        if (serialMatches(snBuf)) {
-          switch (provCmd) {
-            case 'H': homeModule(); saveState();        break;
-            case 'D': dumpEeprom();                     break;
-            case 'A': dumpAll();                        break;
-            case 'T': hallSelfTest();                   break;
-            case 'Q': reportDiagnostics();              break;
-            case 'M': mechanicalTest(MECH_TEST_REVS);   break;
-            case 'F': resetEepromDefaults();            break;
-          }
-        }
-        bufClear(snBuf, snLen); parseState = 0; break;
-
-      // ── State 14: 'I' assign ID by serial number ──────────────────────
-      case 14:
-        if (c == ':' && !snColonSeen) {
-          snColonSeen = true; bufClear(numBuf, numLen);
-        } else if (c != '\n' && c != '\r') {
-          if (!snColonSeen) bufAppend(snBuf, snLen, SNBUF_MAX, c);
-          else if (isDigit(c)) bufAppend(numBuf, numLen, NUMBUF_MAX, c);
-        } else {
-          if (snColonSeen && numLen > 0 && serialMatches(snBuf)) {
-            moduleId = (uint8_t)bufToLong(numBuf, numLen);
-            eepromUpdateByte(ADDR_MODULE_ID, moduleId);
-
-            delay(20);
-            txBegin();
-            rs485.print("mXack:");
-            rs485.print(serialStr);
-            txNumField(moduleId);
-            rs485.print("\n");
-            txEnd();
-          }
-          bufClear(snBuf, snLen); snColonSeen = false; bufClear(numBuf, numLen); parseState = 0;
-        }
-        break;
-
-      // ── State 23: optional revolution count for direct 'M' ────────────
-      // Reached after a direct (non-broadcast) 'm<id>M'.  Collects optional
-      // digits: bare 'm<id>M' → default count; 'm<id>M<n>' → n (clamped inside
-      // mechanicalTest to [MECH_TEST_REVS_MIN, MECH_TEST_REVS_MAX]).
-      case 23:
-        if (isDigit(c)) { bufAppend(numBuf, numLen, NUMBUF_MAX, c); break; }
-        // Terminator (\n, \r, or anything else): run with the parsed count, or
-        // the default if no digits were supplied.
-        mechanicalTest(numLen > 0 ? (int)bufToLong(numBuf, numLen) : MECH_TEST_REVS);
-        bufClear(numBuf, numLen);
-        parseState = 0;
-        break;
-
-      // ── State 17: 'W' restore EEPROM by serial number ─────────────────
-      // Format:  mXW<serialNumber>:<homeOffset>:<totalSteps>:<idx>=<pos>,...\n
-      //
-      //   snBuf       accumulates the 20-char serial number
-      //   restoreBuf  accumulates everything after the first ':' (length-capped)
-      //
-      // Module ID and magic byte are always preserved; all other calibration
-      // fields and the flap map are overwritten with the supplied values.
-      case 17:
-        if (c == ':' && !snColonSeen) {
-          // First colon — switch from accumulating SN to accumulating payload
-          snColonSeen = true;
-        } else if (c != '\n' && c != '\r') {
-          if (!snColonSeen) bufAppend(snBuf, snLen, SNBUF_MAX, c);
-          else              bufAppend(restoreBuf, restoreLen, RESTORE_MAX, c);
-        } else {
-          // Terminator — act if this module matches
-          if (snColonSeen && serialMatches(snBuf)) {
-            restoreEepromFromPayload(restoreBuf);
-          }
-          bufClear(snBuf, snLen); snColonSeen = false;
-          restoreLen = 0; restoreBuf[0] = '\0'; parseState = 0;
-        }
-        break;
-
-      // ── State 18: optional range for a broadcast version/all query ─────
-      // Reached after "m*v" or "m*A".  Accepts an optional "<lo>-<hi>" range:
-      //   m*v\n / m*A\n   → whole bus   (replyRangeLo=0,  replyRangeHi=254)
-      //   m*v0-49\n       → IDs 0–49 only
-      //   m*A50-99\n      → IDs 50–99 only
-      //
-      // broadcastReplyType (set on entry) selects whether matching modules
-      // reply with a version frame or a combined all-fields dump.
-      // numBuf accumulates the low number until '-', then the high number.
-      // snColonSeen is reused here as a "seen the dash" flag.
-      case 18:
-        if (isDigit(c)) {
-          bufAppend(numBuf, numLen, NUMBUF_MAX, c);
-        } else if (c == '-') {
-          // Low bound complete; start collecting high bound.
-          replyRangeLo = (int)bufToLong(numBuf, numLen);
-          bufClear(numBuf, numLen);
-          snColonSeen = true;  // reused: marks that we've passed the dash
-        } else {
-          // Terminator (\n, \r, or anything else) — finalise and schedule.
-          if (snColonSeen) {
-            if (numLen > 0) replyRangeHi = (int)bufToLong(numBuf, numLen);
-          } else {
-            if (numLen > 0) {
-              replyRangeLo = (int)bufToLong(numBuf, numLen);
-              replyRangeHi = replyRangeLo;
-            }
-          }
-          schedulePendingReply(broadcastReplyType, true);
-          bufClear(numBuf, numLen); snColonSeen = false; parseState = 0;
-        }
-        break;
-
-      // ── State 24: 'N' configure flap count + char set ─────────────────
-      // Form: m<id>N<count>:<chars>   (count and chars both optional)
-      //   - before the FIRST ':' → digits accumulate as the flap count
-      //   - after  the FIRST ':' → every byte (incl. further ':') is a flap
-      //     char, taken verbatim until the terminator
-      // Applied on '\n'/'\r' (or after 50 ms idle, which feeds a '\n').  No reply.
-      case 24:
-        if (!snColonSeen) {
-          if (c == ':')             { snColonSeen = true; }          // → chars
-          else if (isDigit(c))      { bufAppend(numBuf, numLen, NUMBUF_MAX, c); }
-          else if (c == '\n' || c == '\r') {
-            applyFlapConfig();
-            bufClear(numBuf, numLen); restoreLen = 0; restoreBuf[0] = '\0';
-            snColonSeen = false; parseState = 0;
-          }
-          // any other char before ':' is ignored (malformed count)
-        } else {
-          if (c == '\n' || c == '\r') {
-            applyFlapConfig();
-            bufClear(numBuf, numLen); restoreLen = 0; restoreBuf[0] = '\0';
-            snColonSeen = false; parseState = 0;
-          } else if (restoreLen < MAX_FLAPS) {
-            restoreBuf[restoreLen++] = c;     // accumulate the char set verbatim
-            restoreBuf[restoreLen]   = '\0';
-          }
-          // chars beyond MAX_FLAPS are dropped (buffer full)
-        }
-        break;
-
-      // ── State 25: 'N' configure flap set by serial number ─────────────
-      // Form: mXN<serialNumber>:<count>:<chars>   (count and chars optional)
-      // tempIndex tracks the field: 0 = serial number, 1 = count, 2 = chars.
-      // Only the module whose serial matches applies the change.  Like the
-      // direct 'N', the chars field is taken verbatim and may contain ':'.
-      case 25:
-        if (tempIndex == 0) {                       // serial number
-          if (c == ':')                        tempIndex = 1;
-          else if (c != '\n' && c != '\r')     bufAppend(snBuf, snLen, SNBUF_MAX, c);
-          else { bufClear(snBuf, snLen); parseState = 0; }   // no colon → abort
-        } else if (tempIndex == 1) {                // count
-          if (c == ':')                        tempIndex = 2;
-          else if (isDigit(c))                 bufAppend(numBuf, numLen, NUMBUF_MAX, c);
-          else if (c == '\n' || c == '\r') {
-            if (serialMatches(snBuf)) applyFlapConfig();
-            bufClear(snBuf, snLen); bufClear(numBuf, numLen); parseState = 0;
-          }
-        } else {                                    // chars (verbatim)
-          if (c == '\n' || c == '\r') {
-            if (serialMatches(snBuf)) applyFlapConfig();
-            bufClear(snBuf, snLen); bufClear(numBuf, numLen);
-            restoreLen = 0; restoreBuf[0] = '\0'; parseState = 0;
-          } else if (restoreLen < MAX_FLAPS) {
-            restoreBuf[restoreLen++] = c;
-            restoreBuf[restoreLen]   = '\0';
-          }
-        }
-        break;
-
-    }  // end switch(parseState)
+    if (crcLen) {                         // collecting a checksummed frame
+      if (c == '\n' || c == '\r') runCrcFrame();
+      else if (crcLen < DUMP_BUF_SIZE - 1) workBuf[crcLen++] = c;
+      else crcLen = DUMP_BUF_SIZE;        // too long: marked, then dropped at its end
+    } else if (c == '~' && parseState == 0) {
+      workBuf[0] = c; crcLen = 1;         // a checksummed frame starts (see CHECKSUMS)
+    } else {
+      parseByte(c);
+    }
 
     // Last pre-gap byte consumed (see the overflow guard above): whatever frame
     // is still open lost its tail — abandon it and skip the spliced remainder.

@@ -77,6 +77,27 @@ Two other things are gated on the parser being idle (`parseState == 0`): the def
 
 The idle timeouts are part of the same loop. A state that applies a command on its terminator (the numeric commands, the broadcast range, the `M` count and the `N` flap set) is fed a synthetic `\n` after 50 ms of silence, so a command sent without a terminator runs exactly the code a terminated one does; every other state is abandoned after 200 ms.
 
+### Checksummed frames
+
+The checksum is a layer in front of the parser, not a feature inside it. Many commands act before their frame has ended:
+- a query replies on its command letter;
+- `-` moves on its character;
+- a number applies at its first non-digit.
+
+A checksum can only be checked once the frame is complete, so threading verification through every state would have meant changing every command's timing. Instead, `loop()` decides at the frame boundary:
+- **Collect.** A `~` arriving with the parser idle starts a checksummed frame, which is collected whole in the shared work buffer, up to its terminator or 50 ms of silence.
+- **Check.** `runCrcFrame()` drops a frame addressed to another module unchecked, exactly as the parser would ignore it. For this module it checks the CRC-16.
+- **Replay.** If the check passes, `runCrcFrame()` feeds the frame's bytes through the unchanged parser (`parseByte()`), as if they had just arrived plain, with `replyCrc` set.
+- **Stop.** The replay stops as soon as the command has run, because its reply may already have reused the work buffer. Replies from the parser may overwrite the buffer only behind the replay position, which the `N` and `mXW` accumulators also respect.
+
+A checksummed frame therefore runs exactly the code its plain twin would. Plain frames never enter the layer.
+
+Replies follow the same idea: every reply is assembled in the work buffer and sent by `sendReply()`, which puts `~HHHH` in front when `replyCrc` is set. A staggered broadcast reply remembers whether its broadcast was checksummed (`pendingCrc`), because it goes out long after the frame that scheduled it.
+
+Two interactions with the receive path:
+- **The overflow skip.** A `~` ends the post-overflow skip, because a spliced frame cannot pass its own check.
+- **The deferred broadcast reply** is held while a checksummed frame is being collected, because that frame is in the work buffer the reply would be assembled in.
+
 ## Addressing and the message format
 
 Addresses may be two-digit zero-padded (`m05`, v6 style), variable-length decimal (`m138`, v7+), a broadcast wildcard (`m*` / `m**`), a provisioning address (`mX`, all modules regardless of ID), or a ranged broadcast for queries (`m*v0-49`). The `m`-prefix, command-letter vocabulary, and reply shapes are unchanged from v6; everything added since is either a new command letter or an append-only field, so older controllers keep working.
@@ -138,7 +159,13 @@ SRAM is the scarcest resource. Two deliberate choices keep it under control:
 
 The per-call stack cost of the diagnostics is bounded too — for example, the mechanical test's per-rotation array is sized to the maximum requestable rotation count and lives only on the stack during the test.
 
-**Flash is the binding constraint.** The build occupies about 90% of the ATtiny1616's 16 KB program flash (99% in v32), so new features have to be paid for by removing duplication elsewhere. v33 recovered about 1.5 KB that way: the idle timeouts stopped being hand-copied twins of each command's terminator handling (they feed the parser a synthetic `\n`), and the dumps stopped using `snprintf`, which took the ~1 KB printf library and its build flags out of the image. The configurable flap set (v31), for instance, only fit after the repeated RS-485 transmit framing was factored into `txBegin`/`txEnd`/`sendLine`/`txReplyHeader`/`txNumField`, the dump assembly into `appendMsgId`/`appendFlapMap`, the flap-map erase into `clearFlapMap`, the `g` move into `gotoRawStep`, and the seven parameterless serial-number provisioning commands (`H`/`D`/`A`/`T`/`Q`/`M`/`F`) into a single shared parse state dispatched by a stored command letter. That is why the configured character set is read one byte at a time from EEPROM via `flapCharAt()` rather than mirrored into a RAM buffer — it saves both SRAM and the flash of the copy loops. `platformio.ini` builds with `-Os -flto`. Don't bring a `printf`-family call back: one call links the whole library again. When adding code, build and watch the `Flash:` figure, and look for a repeated sequence to factor before assuming a feature won't fit.
+**Flash is the binding constraint.** The build occupies about 93% of the ATtiny1616's 16 KB program flash (99% in v32), so new features have to be paid for by removing duplication elsewhere.
+
+v33 recovered about 1.5 KB that way, and spent about 0.4 KB of it on checksums:
+- the idle timeouts stopped being hand-copied twins of each command's terminator handling (they feed the parser a synthetic `\n`);
+- the replies stopped using `snprintf` and Arduino's number printing, which took the ~1 KB printf library and its build flags out of the image.
+
+The configurable flap set (v31), for instance, only fit after the repeated RS-485 transmit framing was factored into `txBegin`/`txEnd`/`sendLine`/`txReplyHeader`/`txNumField` (since v33 just `txBegin`/`txEnd`/`sendReply`), the dump assembly into `appendMsgId`/`appendFlapMap`, the flap-map erase into `clearFlapMap`, the `g` move into `gotoRawStep`, and the seven parameterless serial-number provisioning commands (`H`/`D`/`A`/`T`/`Q`/`M`/`F`) into a single shared parse state dispatched by a stored command letter. That is why the configured character set is read one byte at a time from EEPROM via `flapCharAt()` rather than mirrored into a RAM buffer — it saves both SRAM and the flash of the copy loops. `platformio.ini` builds with `-Os -flto`. Don't bring a `printf`-family call back: one call links the whole library again. When adding code, build and watch the `Flash:` figure, and look for a repeated sequence to factor before assuming a feature won't fit.
 
 ## Motion model
 
@@ -155,7 +182,7 @@ Every wait-for-sensor loop in the motion and calibration code is bounded by a sa
 
 Three commands let a controller assess module health over the bus without physical inspection. They are designed to be run in order, because each depends on the previous being sound:
 
-1. **`Q` — snapshot (no movement).** Reports reset cause, boot count, supply voltage, EEPROM health, current index and, since v33, three bus counters (receive overflows, broadcast replies sent, and how many of those had to wait for the bus). Fast and safe to poll. Check this first: an unexpected reset cause or a climbing boot count points to a module resetting in the field.
+1. **`Q` — snapshot (no movement).** Reports reset cause, boot count, supply voltage, EEPROM health, current index and, since v33, four bus counters (receive overflows, broadcast replies sent, how many of those had to wait for the bus, and checksummed frames that failed their check). Fast and safe to poll. Check this first: an unexpected reset cause or a climbing boot count points to a module resetting in the field.
 2. **`T` — Hall sensor self-test.** Steps one revolution and classifies the sensor: healthy, stuck active, dead/disconnected, multiple regions (noise), or inverted polarity. The mechanical test observes motion *through* this sensor, so the sensor must be proven healthy before the mechanical result can be trusted.
 3. **`M` — mechanical self-test.** Drives the motor across several revolutions and reports per-rotation step counts plus summary statistics (min, max, spread) and gate observations. The spread and the raw per-rotation trend distinguish a one-off glitch from a progressive fault; the gate fields make a "no motion" result diagnosable (sensor never fired vs. reel under-rotated vs. parked on the magnet). The number of rotations is requestable (`m<id>M<n>`) for better statistics on rare intermittent faults.
 
