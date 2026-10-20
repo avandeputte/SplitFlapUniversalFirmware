@@ -42,7 +42,13 @@ for (const [name, code] of Object.entries(sources)) {
   html = html.replace(tag, () => `<script>\n${code}\n</script>`);
 }
 
+// The wiring pictures live in images/ for FLASHER.md too: inline them as data
+// URLs so that the page stays one file.
+html = html.replace(/src="\.\.\/images\/([\w\/.-]+\.svg)"/g, (m, file) =>
+  `src="data:image/svg+xml;base64,${readFileSync(join(here, '..', 'images', file)).toString('base64')}"`);
+if (html.includes('src="../')) throw new Error('index.html refers to a file outside flasher/ that the build does not inline');
+
 mkdirSync(outDir, { recursive: true });
 const out = join(outDir, 'index.html');
 writeFileSync(out, html);
-console.log(`${out}: firmware v${version}, ${parsed.length} bytes, page ${html.length} bytes`);
+console.log(`${out}: firmware v${version}, ${parsed.length} bytes, page ${Buffer.byteLength(html)} bytes`);

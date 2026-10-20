@@ -1,0 +1,53 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 360 352" role="img" aria-labelledby="title desc">
+  <title id="title">The module's UPDI header, seen from the back</title>
+  <desc id="desc">The back of the module, with no labels: the board is turned over left to right, so the header reads UPDI, G, +3V3 from left to right. +3V3 is the square pad, at the end farthest from the 5-pin IO header, which is now on the left. The flasher's RXD wire (white) goes to UPDI, GND (black) to G, 3V3 (red) to +3V3.</desc>
+  <rect width="360" height="352" rx="14" fill="#f3f1ec"/>
+  <g font-family="system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif">
+    <text x="18" y="30" font-size="15" font-weight="700" fill="#23272b">Back of the module</text>
+    <text x="18" y="48" font-size="12" fill="#5d636b">no labels: the board turned over left to right</text>
+  </g>
+
+  <rect x="18" y="62" width="324" height="210" rx="8" fill="#1c2a25" stroke="#33473f" stroke-width="2"/>
+  <text x="90" y="206" font-family="system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif" font-size="11" font-style="italic" fill="#e3b341">5-pin header</text>
+
+  <g fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M202 124 V272 C202 292 60 280 60 300" stroke="#9aa1a8" stroke-width="8"/>
+    <path d="M202 124 V272 C202 292 60 280 60 300" stroke="#fafafa" stroke-width="5"/>
+    <path d="M236 124 V276 C236 292 180 284 180 300" stroke="#9aa1a8" stroke-width="8"/>
+    <path d="M236 124 V276 C236 292 180 284 180 300" stroke="#1b1d1f" stroke-width="5"/>
+    <path d="M270 124 V280 C270 292 300 288 300 300" stroke="#d93a3a" stroke-width="5"/>
+  </g>
+  <circle cx="60" cy="300" r="5" fill="#fafafa" stroke="#9aa1a8" stroke-width="1.5"/>
+  <circle cx="180" cy="300" r="5" fill="#1b1d1f" stroke="#9aa1a8" stroke-width="1.5"/>
+  <circle cx="300" cy="300" r="5" fill="#d93a3a"/>
+
+  <g fill="#c8a24f">
+    <circle cx="202" cy="124" r="11"/>
+    <circle cx="236" cy="124" r="11"/>
+    <rect x="259" y="113" width="22" height="22"/>
+    <rect x="60" y="140" width="20" height="20"/>
+    <circle cx="70" cy="176" r="10"/>
+    <circle cx="70" cy="202" r="10"/>
+    <circle cx="70" cy="228" r="10"/>
+    <circle cx="70" cy="254" r="10"/>
+  </g>
+  <g fill="#0f1310">
+    <circle cx="202" cy="124" r="5"/>
+    <circle cx="236" cy="124" r="5"/>
+    <circle cx="270" cy="124" r="5"/>
+    <circle cx="70" cy="150" r="4.5"/>
+    <circle cx="70" cy="176" r="4.5"/>
+    <circle cx="70" cy="202" r="4.5"/>
+    <circle cx="70" cy="228" r="4.5"/>
+    <circle cx="70" cy="254" r="4.5"/>
+  </g>
+
+  <g font-family="system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif" text-anchor="middle">
+    <text x="60" y="322" font-size="14" font-weight="700" fill="#23272b">UPDI</text>
+    <text x="180" y="322" font-size="14" font-weight="700" fill="#23272b">G</text>
+    <text x="300" y="322" font-size="14" font-weight="700" fill="#23272b">+3V3</text>
+    <text x="60" y="340" font-size="12" fill="#5d636b">flasher RXD</text>
+    <text x="180" y="340" font-size="12" fill="#5d636b">flasher GND</text>
+    <text x="300" y="340" font-size="12" fill="#5d636b">flasher 3V3</text>
+  </g>
+</svg>

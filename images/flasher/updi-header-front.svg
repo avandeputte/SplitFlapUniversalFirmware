@@ -1,0 +1,68 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 360 352" role="img" aria-labelledby="title desc">
+  <title id="title">The module's UPDI header, seen from the front</title>
+  <desc id="desc">The front of the module, where the labels are printed. Left to right: +3V3 (the square pad), G, UPDI. The 5-pin IO header is to the right, nearest UPDI. The flasher's 3V3 wire (red) goes to +3V3, GND (black) to G, RXD (white) to UPDI.</desc>
+  <rect width="360" height="352" rx="14" fill="#f3f1ec"/>
+  <g font-family="system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif">
+    <text x="18" y="30" font-size="15" font-weight="700" fill="#23272b">Front of the module</text>
+    <text x="18" y="48" font-size="12" fill="#5d636b">the side with the printed labels</text>
+  </g>
+
+  <rect x="18" y="62" width="324" height="210" rx="8" fill="#1c2a25" stroke="#33473f" stroke-width="2"/>
+
+  <g font-family="ui-monospace, Menlo, Consolas, monospace" fill="#e9eeeb">
+    <text x="124" y="88" font-size="12" text-anchor="middle">UPDI Interface</text>
+    <text x="90" y="104" font-size="11" text-anchor="middle">+3V3</text>
+    <text x="124" y="104" font-size="11" text-anchor="middle">G</text>
+    <text x="158" y="104" font-size="11" text-anchor="middle">UPDI</text>
+    <text x="306" y="154" font-size="11">IO1</text>
+    <text x="306" y="180" font-size="11">IO2</text>
+    <text x="306" y="206" font-size="11">IO3</text>
+    <text x="306" y="232" font-size="11">IO4</text>
+    <text x="306" y="258" font-size="11">IO5</text>
+  </g>
+  <g fill="none" stroke="#e9eeeb" stroke-width="1.2">
+    <rect x="73" y="110" width="102" height="28" rx="1"/>
+    <rect x="277" y="137" width="26" height="130" rx="1"/>
+  </g>
+
+  <g fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M90 124 V280 C90 292 60 288 60 300" stroke="#d93a3a" stroke-width="5"/>
+    <path d="M124 124 V276 C124 292 180 284 180 300" stroke="#9aa1a8" stroke-width="8"/>
+    <path d="M124 124 V276 C124 292 180 284 180 300" stroke="#1b1d1f" stroke-width="5"/>
+    <path d="M158 124 V272 C158 292 300 280 300 300" stroke="#9aa1a8" stroke-width="8"/>
+    <path d="M158 124 V272 C158 292 300 280 300 300" stroke="#fafafa" stroke-width="5"/>
+  </g>
+  <circle cx="60" cy="300" r="5" fill="#d93a3a"/>
+  <circle cx="180" cy="300" r="5" fill="#1b1d1f" stroke="#9aa1a8" stroke-width="1.5"/>
+  <circle cx="300" cy="300" r="5" fill="#fafafa" stroke="#9aa1a8" stroke-width="1.5"/>
+
+  <g fill="#c8a24f">
+    <rect x="79" y="113" width="22" height="22"/>
+    <circle cx="124" cy="124" r="11"/>
+    <circle cx="158" cy="124" r="11"/>
+    <rect x="280" y="140" width="20" height="20"/>
+    <circle cx="290" cy="176" r="10"/>
+    <circle cx="290" cy="202" r="10"/>
+    <circle cx="290" cy="228" r="10"/>
+    <circle cx="290" cy="254" r="10"/>
+  </g>
+  <g fill="#0f1310">
+    <circle cx="90" cy="124" r="5"/>
+    <circle cx="124" cy="124" r="5"/>
+    <circle cx="158" cy="124" r="5"/>
+    <circle cx="290" cy="150" r="4.5"/>
+    <circle cx="290" cy="176" r="4.5"/>
+    <circle cx="290" cy="202" r="4.5"/>
+    <circle cx="290" cy="228" r="4.5"/>
+    <circle cx="290" cy="254" r="4.5"/>
+  </g>
+
+  <g font-family="system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif" text-anchor="middle">
+    <text x="60" y="322" font-size="14" font-weight="700" fill="#23272b">+3V3</text>
+    <text x="180" y="322" font-size="14" font-weight="700" fill="#23272b">G</text>
+    <text x="300" y="322" font-size="14" font-weight="700" fill="#23272b">UPDI</text>
+    <text x="60" y="340" font-size="12" fill="#5d636b">flasher 3V3</text>
+    <text x="180" y="340" font-size="12" fill="#5d636b">flasher GND</text>
+    <text x="300" y="340" font-size="12" fill="#5d636b">flasher RXD</text>
+  </g>
+</svg>

@@ -50,6 +50,8 @@
   .notice.ok { background: var(--soft-ok); color: var(--ok); }
   .notice p:last-child { margin: 0; }
   ul.wiring { margin: 6px 0 10px; padding-left: 20px; }
+  .wiring-figures { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px; margin: 4px 0 10px; }
+  .wiring-figures img { display: block; width: 100%; height: auto; }
   ol.steps { list-style: none; margin: 14px 0 0; padding: 0; }
   ol.steps li { display: flex; align-items: center; gap: 10px; padding: 3px 0; color: var(--muted); }
   ol.steps li .icon { width: 18px; text-align: center; flex: none; }
@@ -102,6 +104,11 @@
       <li>flasher <code>GND</code> to module <code>G</code></li>
       <li>flasher <code>RXD</code> to module <code>UPDI</code></li>
     </ul>
+    <div class="wiring-figures">
+      <img src="../images/flasher/updi-header-front.svg" width="360" height="352" alt="Front of the module, where the labels are printed: left to right +3V3 (the square pad), G, UPDI, with the 5-pin header to the right. Flasher 3V3 to +3V3, GND to G, RXD to UPDI.">
+      <img src="../images/flasher/updi-header-back.svg" width="360" height="352" alt="Back of the module, turned over left to right: UPDI, G, +3V3 (the square pad), with the 5-pin header now to the left. Flasher RXD to UPDI, GND to G, 3V3 to +3V3.">
+    </div>
+    <p class="small">From either side, <strong>G is the middle pin</strong> and <strong>+3V3 is the square pad</strong>, at the end farthest from the 5-pin header. UPDI is the end nearest it.</p>
     <p class="small muted">The flasher powers the module while it is being flashed. How to build one: <a href="https://github.com/avandeputte/SplitFlapUniversalFirmware/blob/main/FLASHER.md">FLASHER.md</a>.</p>
     <div class="row">
       <button id="connect" class="primary">Choose flasher…</button>
