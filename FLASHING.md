@@ -1,4 +1,20 @@
-# Flashing a release with avrdude, no PlatformIO needed
+# Flashing a release, no PlatformIO needed
+
+## The easy way: the web flasher
+
+Open the **[web flasher](https://avandeputte.github.io/SplitFlapUniversalFirmware/)** in Chrome or Edge on a desktop computer, choose the flasher, and click **Flash module**. There is nothing to install, and it does everything this page describes:
+
+1. It checks the chip.
+2. It saves a backup of the module's settings to a file.
+3. It writes the fuses, if the chip needs them.
+4. It flashes the current release and verifies it.
+5. It checks the module kept its ID and calibration.
+
+Then attach the next module and click **Flash next module**.
+
+To use it offline, download `flasher.html` from the Assets of the [latest release](https://github.com/avandeputte/SplitFlapUniversalFirmware/releases/latest) and open it in Chrome or Edge. Firefox and Safari can't talk to serial ports; for those, or for scripting, use avrdude as below.
+
+## With avrdude
 
 You do not need VSCode, PlatformIO or a compiler to put the current firmware on a module. Every [release](https://github.com/avandeputte/SplitFlapUniversalFirmware/releases/latest) includes the compiled `firmware.hex`, and the free command-line tool **avrdude** writes it to the chip through the [SerialUPDI flasher](FLASHER.md). Two commands per module: one writes the fuses, one writes the firmware.
 

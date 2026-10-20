@@ -1,0 +1,146 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Split-Flap Flasher</title>
+<meta name="description" content="Flash split-flap module firmware from the browser, with nothing to install.">
+<style>
+  :root {
+    --bg: #f6f5f2; --panel: #ffffff; --text: #1f2328; --muted: #5d636b; --line: #dedbd4;
+    --accent: #1f6f5c; --accent-text: #ffffff; --ok: #1e7a3d; --bad: #b42318; --warn: #8a5a00;
+    --soft-ok: #e7f4ea; --soft-bad: #fdecea; --soft-warn: #fdf3df; --code: #efede8;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #15171a; --panel: #1d2024; --text: #e6e6e3; --muted: #a0a4aa; --line: #33373d;
+      --accent: #4fb39a; --accent-text: #0b1512; --ok: #6cc98a; --bad: #f2867b; --warn: #e5b45c;
+      --soft-ok: #18291e; --soft-bad: #33191a; --soft-warn: #2f2614; --code: #2a2d32;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #15171a; --panel: #1d2024; --text: #e6e6e3; --muted: #a0a4aa; --line: #33373d;
+    --accent: #4fb39a; --accent-text: #0b1512; --ok: #6cc98a; --bad: #f2867b; --warn: #e5b45c;
+    --soft-ok: #18291e; --soft-bad: #33191a; --soft-warn: #2f2614; --code: #2a2d32;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 16px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  main { max-width: 760px; margin: 0 auto; padding: 32px 16px 64px; }
+  h1 { font-size: 1.6rem; margin: 0 0 4px; letter-spacing: -0.01em; }
+  h2 { font-size: 1.1rem; margin: 0 0 8px; }
+  p { margin: 0 0 8px; }
+  .lede { color: var(--muted); margin-bottom: 20px; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 18px 20px; margin: 0 0 14px; }
+  .step-label { color: var(--muted); font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 2px; }
+  .row { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 16px; }
+  button { font: inherit; border-radius: 8px; padding: 9px 16px; border: 1px solid var(--line);
+           background: var(--panel); color: var(--text); cursor: pointer; }
+  button.primary { background: var(--accent); color: var(--accent-text); border-color: var(--accent); font-weight: 600; }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+  button:focus-visible, a:focus-visible, input:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
+  a { color: var(--accent); }
+  code { background: var(--code); border-radius: 4px; padding: 1px 5px; font-size: 0.92em; }
+  .muted { color: var(--muted); }
+  .small { font-size: 0.9rem; }
+  .status { font-weight: 600; }
+  .notice { border-radius: 8px; padding: 12px 14px; margin: 0 0 14px; }
+  .notice.bad { background: var(--soft-bad); color: var(--bad); }
+  .notice.warn { background: var(--soft-warn); color: var(--warn); }
+  .notice.ok { background: var(--soft-ok); color: var(--ok); }
+  .notice p:last-child { margin: 0; }
+  ul.wiring { margin: 6px 0 10px; padding-left: 20px; }
+  ol.steps { list-style: none; margin: 14px 0 0; padding: 0; }
+  ol.steps li { display: flex; align-items: center; gap: 10px; padding: 3px 0; color: var(--muted); }
+  ol.steps li .icon { width: 18px; text-align: center; flex: none; }
+  ol.steps li.active { color: var(--text); font-weight: 600; }
+  ol.steps li.done { color: var(--text); }
+  ol.steps li.done .icon { color: var(--ok); }
+  ol.steps li.failed { color: var(--bad); font-weight: 600; }
+  .spinner { display: inline-block; width: 12px; height: 12px; border: 2px solid var(--line);
+             border-top-color: var(--accent); border-radius: 50%; animation: spin 0.8s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  @media (prefers-reduced-motion: reduce) { .spinner { animation: none; } }
+  progress { width: 100%; height: 8px; margin-top: 10px; accent-color: var(--accent); }
+  dl.facts { display: grid; grid-template-columns: max-content 1fr; gap: 2px 16px; margin: 10px 0 0; }
+  dl.facts dt { color: var(--muted); }
+  dl.facts dd { margin: 0; font-variant-numeric: tabular-nums; }
+  table { width: 100%; border-collapse: collapse; font-size: 0.92rem; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); }
+  th { color: var(--muted); font-weight: 600; }
+  td.serial { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.85rem; }
+  details pre { background: var(--code); border-radius: 8px; padding: 10px; overflow: auto; max-height: 260px;
+                font: 0.8rem/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; }
+  footer { color: var(--muted); font-size: 0.85rem; margin-top: 24px; }
+  .hidden { display: none !important; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Split-Flap Module Flasher</h1>
+  <p class="lede">Puts the module firmware on a split-flap module from this page. There is nothing to install, and nothing leaves your computer.</p>
+
+  <div id="unsupported" class="notice bad hidden">
+    <p><strong>This browser can't talk to serial ports.</strong> Open this page in Chrome or Edge on a desktop computer. Firefox and Safari don't support it.</p>
+  </div>
+
+  <section class="card" aria-labelledby="fw-title">
+    <h2 id="fw-title">Firmware</h2>
+    <p id="fw-summary" class="muted">No firmware loaded yet.</p>
+    <div class="row small">
+      <label for="fw-file">Use a different firmware file:</label>
+      <input id="fw-file" type="file" accept=".hex,text/plain">
+    </div>
+  </section>
+
+  <section class="card" aria-labelledby="connect-title">
+    <div class="step-label">Step 1</div>
+    <h2 id="connect-title">Connect the flasher</h2>
+    <p>Plug the flasher into USB and wire it to the module's <code>UPDI Interface</code> header:</p>
+    <ul class="wiring small">
+      <li>flasher <code>3V3</code> to module <code>+3V3</code></li>
+      <li>flasher <code>GND</code> to module <code>G</code></li>
+      <li>flasher <code>RXD</code> to module <code>UPDI</code></li>
+    </ul>
+    <p class="small muted">The flasher powers the module while it is being flashed. How to build one: <a href="https://github.com/avandeputte/SplitFlapUniversalFirmware/blob/main/FLASHER.md">FLASHER.md</a>.</p>
+    <div class="row">
+      <button id="connect" class="primary">Choose flasher…</button>
+      <span id="port-status" class="muted" role="status">Not connected.</span>
+    </div>
+  </section>
+
+  <section class="card" aria-labelledby="flash-title">
+    <div class="step-label">Step 2</div>
+    <h2 id="flash-title">Flash a module</h2>
+    <div class="row">
+      <button id="flash" class="primary" disabled>Flash module</button>
+      <label class="small"><input id="autosave" type="checkbox" checked> Save each module's settings backup automatically</label>
+    </div>
+    <ol id="steps" class="steps hidden" aria-live="polite"></ol>
+    <progress id="progress" class="hidden" max="1" value="0"></progress>
+    <div id="outcome" class="hidden" role="status"></div>
+  </section>
+
+  <section id="session-card" class="card hidden" aria-labelledby="session-title">
+    <h2 id="session-title">Flashed this session</h2>
+    <table>
+      <thead><tr><th>Module</th><th>Serial number</th><th>Result</th><th>Settings backup</th></tr></thead>
+      <tbody id="session"></tbody>
+    </table>
+  </section>
+
+  <details class="card">
+    <summary>Troubleshooting log</summary>
+    <pre id="log"></pre>
+  </details>
+
+  <footer>
+    <p>Works like the avrdude route in <a href="https://github.com/avandeputte/SplitFlapUniversalFirmware/blob/main/FLASHING.md">FLASHING.md</a>, including writing the fuses a new chip needs. The module's ID and calibration are kept, and are backed up before anything is written.</p>
+  </footer>
+</main>
+<script src="firmware.js"></script>
+<script src="updi.js"></script>
+<script src="webserial.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
