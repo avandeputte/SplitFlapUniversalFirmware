@@ -22,7 +22,7 @@ New fuses take effect only at the restart in step 6. A reset any earlier would e
 | `updi.js` | The programming core: the UPDI protocol (as Microchip's pymcuprog and avrdude's `serialupdi` implement it), Intel HEX parsing, and the routine above. It has no browser dependencies, so it also runs under Node. |
 | `webserial.js` | The serial port, through the Web Serial API. |
 | `index.html`, `app.js` | The page. |
-| `build.mjs` | Builds the published page: `node flasher/build.mjs <firmware.hex> <version>` writes `flasher/dist/index.html`, a single file with the scripts and the firmware inlined. It uses plain Node, with no packages. |
+| `build.mjs` | Builds the published page: `node flasher/build.mjs <firmware.hex> <version>` writes `flasher/dist/index.html`, a single file with the scripts, the wiring pictures from `images/flasher/` and the firmware inlined. It uses plain Node, with no packages. |
 
 ## Publishing
 

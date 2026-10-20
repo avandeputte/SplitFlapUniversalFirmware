@@ -2,7 +2,7 @@
 
 The split-flap modules use an ATtiny1616, which is programmed over **UPDI**, a single-wire interface. You do not need a dedicated programmer: a cheap CH340 USB-to-TTL adapter with **one Schottky diode** soldered across two of its pins does the whole job. This page shows the build and explains why the diode has to point one particular way.
 
-The only tool you need is a soldering iron.
+The only tool you need is a soldering iron. Once the flasher is built, the **[web flasher](https://avandeputte.github.io/SplitFlapUniversalFirmware/)** uses it to flash modules from Chrome or Edge, with nothing to install.
 
 ## Parts
 
@@ -81,9 +81,18 @@ On the physical part the cathode is marked by a **band** printed on one end of t
 | `RXD` | `UPDI` | The shared data line. |
 | `TXD` | nothing | Only the diode connects here. |
 
+From the back of a module the labels can't be seen. From either side, `G` is the middle pin and `+3V3` is the square pad, at the end farthest from the 5-pin `IO1`–`IO5` header. `UPDI` is the end nearest that header.
+
+<p>
+<img src="images/flasher/updi-header-front.svg" width="49%" alt="Front of the module, where the labels are printed: left to right +3V3 (the square pad), G, UPDI, with the 5-pin header to the right. Flasher 3V3 to +3V3, GND to G, RXD to UPDI.">
+<img src="images/flasher/updi-header-back.svg" width="49%" alt="Back of the module, turned over left to right: UPDI, G, +3V3 (the square pad), with the 5-pin header now to the left. Flasher RXD to UPDI, GND to G, 3V3 to +3V3.">
+</p>
+
 ## Flashing
 
-`platformio.ini` in this repository already selects this programmer; only the port name needs to match your adapter:
+The easiest way is the **[web flasher](https://avandeputte.github.io/SplitFlapUniversalFirmware/)**. Open it in Chrome or Edge, choose the flasher and click **Flash module**. It writes the fuses a new chip needs, backs up the module's settings, then flashes and verifies the current release.
+
+To flash with PlatformIO instead: `platformio.ini` in this repository already selects this programmer, and only the port name needs to match your adapter:
 
 ```ini
 upload_protocol = serialupdi
