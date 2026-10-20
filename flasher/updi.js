@@ -61,16 +61,29 @@
   // (This flasher erases page by page, which never touches the EEPROM.)  Fuse 3
   // does not exist on this part.  SYSCFG0 is written last, after everything
   // else has gone right.
-  const FUSES = [
-    { number: 0, name: 'WDTCFG',  value: 0x00 },
-    { number: 1, name: 'BODCFG',  value: 0x54 },
-    { number: 2, name: 'OSCCFG',  value: 0x02 },
-    { number: 4, name: 'TCD0CFG', value: 0x00 },
-    { number: 6, name: 'SYSCFG1', value: 0x06 },
-    { number: 7, name: 'APPEND',  value: 0x00 },
-    { number: 8, name: 'BOOTEND', value: 0x00 },
-    { number: 5, name: 'SYSCFG0', value: 0xC5 },
-  ];
+  //
+  // BOOTEND depends on the image: from v34 on, an image starts with the 1 KB
+  // bootloader that takes updates over the bus, and needs BOOTEND = 0x04 (the
+  // firmware's interrupt vectors are then at 0x0400); older images need 0x00.
+  // An image has the bootloader if its signature ('S','F','B',version) is at
+  // the end of the boot section.
+  const BOOTLOADER_SIGNATURE_AT = 0x3FC;
+  function bootloaderVersion(firmware) {
+    const im = firmware.image, at = BOOTLOADER_SIGNATURE_AT;
+    return im[at] === 0x53 && im[at + 1] === 0x46 && im[at + 2] === 0x42 ? im[at + 3] : 0;
+  }
+  function fusesFor(firmware) {
+    return [
+      { number: 0, name: 'WDTCFG',  value: 0x00 },
+      { number: 1, name: 'BODCFG',  value: 0x54 },
+      { number: 2, name: 'OSCCFG',  value: 0x02 },
+      { number: 4, name: 'TCD0CFG', value: 0x00 },
+      { number: 6, name: 'SYSCFG1', value: 0x06 },
+      { number: 7, name: 'APPEND',  value: 0x00 },
+      { number: 8, name: 'BOOTEND', value: bootloaderVersion(firmware) ? 0x04 : 0x00 },
+      { number: 5, name: 'SYSCFG0', value: 0xC5 },
+    ];
+  }
   const FUSE_COUNT = 9;                    // fuse0..fuse8, read as one block
 
   const BAUD = 57600;                      // the speed avrdude uses with this flasher
@@ -456,7 +469,8 @@
       on.step('fuses', 'Checking the fuses');
       const before = await updi.readFuses();
       result.fusesBefore = Array.from(before);
-      const wrong = FUSES.filter((f) => before[f.number] !== f.value);
+      const fuses = fusesFor(firmware);
+      const wrong = fuses.filter((f) => before[f.number] !== f.value);
       if (wrong.length) {
         let expected = Uint8Array.from(before);
         for (const f of wrong) {
@@ -529,7 +543,7 @@
     }
   }
 
-  const api = { CHIP, FUSES, Updi, FlasherError, parseIntelHex, toIntelHex, describeEeprom, flashModule };
+  const api = { CHIP, Updi, FlasherError, parseIntelHex, toIntelHex, describeEeprom, bootloaderVersion, fusesFor, flashModule };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   else root.SplitFlapUpdi = api;
 })(typeof window !== 'undefined' ? window : globalThis);

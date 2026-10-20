@@ -48,7 +48,7 @@ The firmware is a single C++ file (`src/SplitFlapUniversalFirmware.cpp`). Readin
 
 On reset, `setup()`:
 
-1. Captures the reset cause from `RSTCTRL.RSTFR` (so `Q` can later report *why* the module last reset) and increments a boot counter in EEPROM.
+1. Captures the reset cause (so `Q` can later report *why* the module last reset) and increments a boot counter in EEPROM. megaTinyCore's startup has already read and cleared `RSTCTRL.RSTFR` and left the bits in `GPIOR0`, which is what the firmware reads; before v34 it read `RSTFR` and so always got 0. Before any of this, since v34, the [bootloader](bootloader/README.md) has checked the firmware image and started it.
 2. Reads the ATtiny serial number from `SIGROW` and seeds the RNG from it.
 3. Loads configuration from EEPROM. The first byte is a magic value: `0x5D` is current; `0x5E` is a v8/v9-era layout that is loaded and then rewritten to `0x5D`; anything else is treated as a blank chip and initialised to defaults with module ID 255 (unprovisioned). Loaded calibration values are sanity-clamped. The configurable flap count and "is the character set custom?" flag are loaded here too (`loadFlapConfig`), falling back to the 64-flap default when never set.
 4. Waits a **staggered startup delay** so that a display full of modules powering on together does not all lurch at once (inrush). Provisioned modules use a delay derived from their ID; unprovisioned modules use a random delay seeded from their serial number.
@@ -159,7 +159,7 @@ SRAM is the scarcest resource. Two deliberate choices keep it under control:
 
 The per-call stack cost of the diagnostics is bounded too — for example, the mechanical test's per-rotation array is sized to the maximum requestable rotation count and lives only on the stack during the test.
 
-**Flash is the binding constraint.** The build occupies about 93% of the ATtiny1616's 16 KB program flash (99% in v32), so new features have to be paid for by removing duplication elsewhere.
+**Flash is the binding constraint.** Since v34 the firmware shares the ATtiny1616's 16 KB with a 1 KB [bootloader](bootloader/README.md): it is linked at `0x0400` and has 15,358 bytes, of which it uses 14,671 (95.5%; v32 used 99% of the whole 16 KB), so new features have to be paid for by removing duplication elsewhere. v34 made the room for the bootloader by replacing `strtol`/`atol` with `parseDecimal()`.
 
 v33 recovered about 1.5 KB that way, and spent about 0.4 KB of it on checksums:
 - the idle timeouts stopped being hand-copied twins of each command's terminator handling (they feed the parser a synthetic `\n`);

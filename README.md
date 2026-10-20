@@ -27,6 +27,7 @@ Firmware for a multi-module split-flap display where each character cell is an i
   - [Calibration Commands](#calibration-commands)
   - [Configuration Commands](#configuration-commands)
   - [Diagnostic Commands](#diagnostic-commands)
+  - [Firmware Update Command (v34+)](#firmware-update-command-v34)
   - [Provisioning Commands](#provisioning-commands)
   - [De-provisioning Command](#de-provisioning-command)
 - [Flap Character Set](#flap-character-set)
@@ -38,6 +39,7 @@ Firmware for a multi-module split-flap display where each character cell is an i
 - [Calibration Workflow](#calibration-workflow)
 - [Diagnostics Workflow](#diagnostics-workflow)
 - [Upgrading Firmware](#upgrading-firmware)
+  - [Updates over the bus (v34+)](#updates-over-the-bus-v34)
 
 ---
 
@@ -45,11 +47,16 @@ Firmware for a multi-module split-flap display where each character cell is an i
 
 ```
 src/SplitFlapUniversalFirmware.cpp  — ATtiny1616 firmware (built with PlatformIO)
+bootloader/                         — The bootloader that takes updates over the bus (v34+)
 platformio.ini                      — PlatformIO build/upload configuration
 .vscode/                            — VSCode + PlatformIO workspace settings
 provision.py                        — Raspberry Pi provisioning and management tool
+tools/busflash.py                   — Updates modules over the bus from a USB–RS485 adapter
+flasher/                            — The web flasher (flashes modules over UPDI from a browser)
 README.md                           — This file (command reference + protocol)
 SETUP.md                            — Step-by-step VSCode + PlatformIO install/build/upload guide
+FLASHING.md, FLASHER.md             — Flashing a release with avrdude; building the UPDI flasher
+BUS-UPDATE.md                       — Firmware updates over the RS-485 bus: protocol and procedure
 ARCHITECTURE.md                     — How the firmware is structured and why
 RELEASE_NOTES.md                    — Per-version change history
 ```
@@ -62,7 +69,7 @@ RELEASE_NOTES.md                    — Per-version change history
 
 The firmware targets the ATtiny1616 via the [megaTinyCore](https://github.com/SpenceKonde/megaTinyCore) platform, built and uploaded with **[PlatformIO](https://platformio.org/)** inside **VSCode** (or via the `pio` CLI). Programming is over **SerialUPDI** (a cheap USB-serial adapter), not a dedicated programmer.
 
-**Just want to flash a module? Use the [web flasher](https://avandeputte.github.io/SplitFlapUniversalFirmware/)** in Chrome or Edge: nothing to install. It writes the fuses a new chip needs, backs up each module's settings, flashes and verifies the current release, and checks the module kept its ID and calibration. For the same without a browser, [FLASHING.md](FLASHING.md) does it with avrdude and the `firmware.hex` attached to every release. **Need a programmer? [FLASHER.md](FLASHER.md)** shows how to turn a CH340 USB-to-serial adapter into a SerialUPDI flasher with one diode. **Want to build the firmware yourself? Follow the full walkthrough in [SETUP.md](SETUP.md)** — it covers installing VSCode, installing PlatformIO, getting the code, and building/uploading from scratch.
+**Just want to flash a module? Use the [web flasher](https://avandeputte.github.io/SplitFlapUniversalFirmware/)** in Chrome or Edge: nothing to install. It writes the fuses a new chip needs, backs up each module's settings, flashes and verifies the current release, and checks the module kept its ID and calibration. For the same without a browser, [FLASHING.md](FLASHING.md) does it with avrdude and the `firmware.hex` attached to every release. **From v34, later updates can go over the bus:** that last flash installs a bootloader, and from then on the gateway updates the whole wall at once, with no module taken down ([BUS-UPDATE.md](BUS-UPDATE.md)). **Need a programmer? [FLASHER.md](FLASHER.md)** shows how to turn a CH340 USB-to-serial adapter into a SerialUPDI flasher with one diode. **Want to build the firmware yourself? Follow the full walkthrough in [SETUP.md](SETUP.md)** — it covers installing VSCode, installing PlatformIO, getting the code, and building/uploading from scratch.
 
 Quick version, once your toolchain is set up:
 
@@ -72,7 +79,7 @@ Quick version, once your toolchain is set up:
    ```bash
    pio run -t fuses
    ```
-   This sets the `EESAVE` fuse (and clock/BOD/UPDI fuses) — the PlatformIO equivalent of the Arduino IDE's *Burn Bootloader*. Without it, every flash wipes the module's ID and calibration (see [Upgrading Firmware](#upgrading-firmware)).
+   This sets the `EESAVE` fuse (and clock/BOD/UPDI fuses, and since v34 `BOOTEND`, which reserves the bootloader's 1 KB) — the PlatformIO equivalent of the Arduino IDE's *Burn Bootloader*. Without it, every flash wipes the module's ID and calibration (see [Upgrading Firmware](#upgrading-firmware)).
 
    The same step enables the **brown-out detector at 2.6 V**. Earlier configurations left BOD disabled, which at 10 MHz let the chip run out of spec during every power ramp and could corrupt or misread EEPROM — the cause of modules "forgetting" their settings after a power cycle. **Modules whose fuses were written before this change need the fuses step run once more.** Writing fuses does not erase EEPROM, so IDs and calibration survive.
 4. Build and upload:
@@ -103,7 +110,11 @@ Once a numeric bus ID (0–254) is assigned via the provisioning tool, the modul
 ```
 Power on
   │
-  ├─ Capture reset cause (RSTFR) and increment the boot counter
+  ├─ Bootloader (v34+): checks the firmware image against its CRC (~150 ms)
+  │     and starts it; stays in update mode instead if the image does not
+  │     check out, or if the firmware asked for an update (BUS-UPDATE.md)
+  │
+  ├─ Capture reset cause and increment the boot counter
   ├─ Read ATtiny serial number from SIGROW
   ├─ Seed random number generator from serial number
   ├─ Load config from EEPROM
@@ -586,12 +597,12 @@ Returns an instantaneous module health snapshot. **No motor movement**, so it is
 
 **Response format:**
 ```
-m<ID>Q:<resetCause>:<bootCount>:<vcc_mV>:<eepromOk>:<curIndex>:<rxOverflows>:<bcastSent>:<bcastLate>:<crcErrors>\n
+m<ID>Q:<resetCause>:<bootCount>:<vcc_mV>:<eepromOk>:<curIndex>:<rxOverflows>:<bcastSent>:<bcastLate>:<crcErrors>:<blVersion>\n
 ```
 
 | Field | Meaning |
 |---|---|
-| `resetCause` | Raw reset-flag bits from the last reset: `0x01` power-on, `0x02` brown-out, `0x04` external, `0x08` watchdog, `0x10` software |
+| `resetCause` | Raw reset-flag bits from the last reset: `0x01` power-on, `0x02` brown-out, `0x04` external, `0x08` watchdog, `0x10` software, `0x20` UPDI. Before v34 this always read `0` (the core's startup cleared the flags before the firmware read them) |
 | `bootCount` | Boots since the counter was last cleared (wraps at 255) — a climbing value indicates a module silently resetting in the field |
 | `vcc_mV` | Measured supply voltage in millivolts |
 | `eepromOk` | `1` if the EEPROM write-read-verify check passed, else `0`. The check itself (two write cycles on a scratch cell) runs on the first `Q` after boot and then at most once per hour; polls in between return the cached result, so `Q` is safe to poll frequently |
@@ -600,12 +611,13 @@ m<ID>Q:<resetCause>:<bootCount>:<vcc_mV>:<eepromOk>:<curIndex>:<rxOverflows>:<bc
 | `bcastSent` | (v33) Staggered broadcast replies (`m*v` / `m*A`) the module has transmitted since boot. Compare with how many the controller actually received |
 | `bcastLate` | (v33) How many of those went out after their slot because the bus was busy (carrier sense), a frame was still arriving, or the module itself was busy |
 | `crcErrors` | (v33) [Checksummed](#checksums-optional-v33) frames for this module (its ID, a broadcast, or `X`) that were dropped because the checksum was malformed or didn't match, or the frame was too long |
+| `blVersion` | (v34) The version of the [bootloader](BUS-UPDATE.md) that takes updates over the bus; `0` if the module has none |
 
 The four v33 counters live in RAM, restart from 0 at every boot and wrap at 65535, so compare successive readings rather than absolute values. Older controllers ignore them.
 
 **Example response:**
 ```
-m38Q:0:2:4980:1:0:0:12:0:0\n
+m38Q:1:2:4980:1:0:0:12:0:0:1\n
 ```
 
 > Watch for a non-zero watchdog (`0x08`) or brown-out (`0x02`) reset bit, a supply voltage sagging below your design target under load, `eepromOk = 0`, or a `bootCount` that keeps climbing between polls. An idle module reads its receive buffer as fast as the bus can fill it, so `rxOverflows` should only move while the module is busy; `bcastSent` running ahead of the replies the controller heard points at collisions or wiring rather than at the module.
@@ -661,6 +673,21 @@ The `gateActive` / `gateSpan` fields make a **code 2** result directly diagnosab
 - `gateActive` ≈ `gateSpan` → the sensor **stayed active the whole time** — parked on the magnet or stuck active.
 
 > Because `M` observes motion *through* the Hall sensor, a working motor with a dead sensor also reports code 2. **Run `T` first** to confirm the sensor is healthy, then interpret an `M` result accordingly.
+
+---
+
+### Firmware Update Command (v34+)
+
+#### `U` — Update mode
+
+Restarts the module into its bootloader, to receive new firmware over the bus. **Only accepted in a [checksummed](#checksums-optional-v33) frame**: a plain `U` is ignored, so line noise can never take a module off line. `m*U` takes every module at once.
+
+```
+~<CRC>m<ID>U\n
+~<CRC>m*U\n
+```
+
+There is no reply: from then on the module answers its bootloader's protocol, not this one, until the update is done or abandoned. [BUS-UPDATE.md](BUS-UPDATE.md) describes the procedure. A module that receives no update returns to its firmware after 8 seconds by itself.
 
 ---
 
@@ -977,6 +1004,8 @@ With PlatformIO: run `pio run -t fuses` **once per chip** (the equivalent of the
 | v8 or v9 | `0x5E` | Fields loaded, magic rewritten to `0x5D` |
 | Blank chip | `0xFF` | Full default init, ID set to 255 |
 
+> **Upgrading to v34:** one last flash over UPDI per module installs the bootloader, and with it the fuse `BOOTEND = 0x04` that reserves its 1 KB. The [web flasher](https://avandeputte.github.io/SplitFlapUniversalFirmware/) sets the fuse by itself. With PlatformIO, run `pio run -t fuses` once more; with avrdude, see [FLASHING.md](FLASHING.md). Every later update can then go [over the bus](#updates-over-the-bus-v34). Same EEPROM layout, and every reply is unchanged except `Q`, which gains the bootloader version at the end and now reports the real reset cause. Going back to v33 or older over UPDI needs `BOOTEND = 0x00` again; the web flasher does that by itself too.
+
 > **Upgrading to v33:** just upload; no fuse change, same EEPROM layout, and every reply to a plain message is unchanged except `Q`, which gains four counters at the end (older controllers ignore them). Messages may now carry an optional [checksum](#checksums-optional-v33). Behaviour differences a controller may notice: a frame sent shortly after a busy module's receive buffer overflowed is now answered instead of discarded, broadcast replies wait for a quiet bus, out-of-range flap positions are refused by `w` and `mXW`, and `+` with no index is ignored. See [RELEASE_NOTES.md](RELEASE_NOTES.md).
 
 > **Upgrading to v32:** the fuses now enable the brown-out detector, so **run `pio run -t fuses` once on every module** in addition to the upload (see [SETUP.md](SETUP.md)). Fuse writes do not erase EEPROM. Nothing else changes: same commands, same replies, same EEPROM layout.
@@ -984,3 +1013,7 @@ With PlatformIO: run `pio run -t fuses` **once per chip** (the equivalent of the
 > **Upgrading to v31 from an earlier version:** the new flap-count and flap-character-set EEPROM fields (`0x8D`/`0x8E`) read back as `0xFF` on a module that predates them, so the module transparently falls back to the default 64-flap set until you configure it with the [`N` command](#n--configure-the-flap-set). No action is required for reels that use the standard 64-flap character set.
 
 > If a module ends up in an unexpected state after flashing, send `m<id>v\n` to confirm the firmware version and `m<id>d\n` (or `m<id>A\n` for everything at once, including the flap set) to inspect its EEPROM. Use `m<id>F\n` to reset calibration to defaults while keeping the ID, or `m<id>R\n` to fully de-provision the module. As a recovery path, keep periodic `mXA` dumps of each module so calibration **and the flap set** can be restored with `mXW` if a chip is ever wiped or replaced.
+
+### Updates over the bus (v34+)
+
+A module with v34 or later carries a bootloader, so its firmware can be replaced over the RS-485 bus. The gateway sends `m*U` to put every module into update mode, broadcasts the new image page by page, checks each module, and starts the new firmware: a whole wall in under a minute, with nothing unplugged. An update that stops part way leaves a module waiting in update mode for the image, never running half of it, and the module's EEPROM is never touched. [BUS-UPDATE.md](BUS-UPDATE.md) has the protocol and the procedure; [`tools/busflash.py`](tools/busflash.py) does the same from a computer with a USB–RS485 adapter.

@@ -88,7 +88,7 @@
 //            auto-detected on first boot and at every calibrate, so this is only
 //            needed after re-mounting a magnet without a full recalibration.
 //  Q         Diagnostics snapshot (DIRECT-ADDRESSED ONLY, no motor movement):
-//              m<id>Q:<resetCause>:<bootCount>:<vcc_mV>:<eepromOk>:<curIndex>:<rxOverflows>:<bcastSent>:<bcastLate>:<crcErrors>\n
+//              m<id>Q:<resetCause>:<bootCount>:<vcc_mV>:<eepromOk>:<curIndex>:<rxOverflows>:<bcastSent>:<bcastLate>:<crcErrors>:<blVersion>\n
 //            resetCause = raw RSTFR bits from last reset (0x01 power-on,
 //            0x02 brown-out, 0x04 external, 0x08 watchdog, 0x10 software);
 //            bootCount = boots since counter reset (wraps 255); vcc_mV =
@@ -100,7 +100,10 @@
 //            went out after their slot (held back by carrier sense, a frame
 //            still arriving, or a busy module); crcErrors = checksummed frames
 //            for this module dropped because the checksum failed (see
-//            CHECKSUMS).
+//            CHECKSUMS).  Appended in v34: blVersion = the version of the
+//            bootloader that takes updates over the bus (BUS-UPDATE.md).
+//            (Before v34 resetCause always read 0: megaTinyCore's startup
+//            clears RSTFR before setup() runs.  It is right from v34 on.)
 //  M[<n>]    Mechanical self-test (DIRECT-ADDRESSED ONLY, drives the motor):
 //              m<id>M:<code>:<min>:<max>:<spreadTenthsPct>:<gateActive>:<gateSpan>:<avgMagnetWidth>:<r1>,<r2>,...,<rN>\n
 //            Samples several revolutions and compares them.  Bare 'm<id>M' uses
@@ -181,6 +184,11 @@
 //            nominal by ~15% of the reply traffic before them.  The lag only
 //            grows with slot index, so it spreads replies apart, never together.
 //  F         Factory-reset EEPROM defaults (preserves module ID and magic byte)
+//  U         Restart into the bootloader to take a firmware update over the
+//            bus (v34; BUS-UPDATE.md).  Only in a checksummed frame (see
+//            CHECKSUMS): a plain 'U' is ignored, so line noise can never take a
+//            module off line.  m*U takes every module.  No reply: from then on
+//            the bootloader answers, in its own protocol.
 //
 // Provisioning commands (address mX, all modules respond):
 //  mXH<sn>         Home by serial number
@@ -424,6 +432,7 @@
 #include <EEPROM.h>
 #include <avr/wdt.h>
 #include <avr/pgmspace.h>
+#include <limits.h>
 
 // ── Deferred reply type ───────────────────────────────────────────────────────
 // MUST be declared before anything else: the Arduino IDE auto-generates forward
@@ -469,6 +478,9 @@ void resetProvisioning();
 void sendVersionResponse();
 void resetEepromDefaults();
 void restoreEepromFromPayload(const char *payload);
+long parseDecimal(const char *p, const char **end);
+void enterBootloader();
+uint8_t bootloaderVersion();
 void applyStep(const uint8_t *step);
 void advance(int steps);
 void releaseMotor();
@@ -496,7 +508,7 @@ void gotoRawStep(long target);
 
 // ── Firmware version ──────────────────────────────────────────────────────────
 // Returned by the 'v', 'A', and mXA commands.  Bump when you change behaviour.
-const char FIRMWARE_VERSION[] = "33";
+const char FIRMWARE_VERSION[] = "34";
 
 // ── Pin assignments ───────────────────────────────────────────────────────────
 // RS-485 transceiver
@@ -515,6 +527,14 @@ const int RS485_DE = 2;     // driver enable       (HIGH = transmit)
 // magnet, so LOW is the sensible default).
 #define HALL_PIN 4
 #define HALL_DEFAULT_ACTIVE LOW
+
+// ── Bootloader (bootloader/, BUS-UPDATE.md) ───────────────────────────────────
+// Since v34 this firmware starts at 0x0400, behind the 1 KB bootloader that
+// takes updates over the bus (fuse BOOTEND = 0x04).  These must match
+// bootloader/bootloader.c.
+#define BOOTLOADER_REQUEST_AT     0x3F00   // RAM word it checks after a software reset,
+#define BOOTLOADER_REQUEST_MAGIC  0xB007   // for this value: "wait for an update"
+#define BOOTLOADER_SIGNATURE_AT   0x03FC   // 'S','F','B',<version>: the end of its section
 
 // ── Mechanical ────────────────────────────────────────────────────────────────
 #define MAX_FLAPS 64        // MAXIMUM physical flaps = capacity of the EEPROM flap
@@ -878,9 +898,25 @@ inline bool bufAppend(char *buf, int &len, int maxLen, char c) {
 }
 inline void bufClear(char *buf, int &len) { len = 0; buf[0] = '\0'; }
 
+// strtol(p, &end, 10), exactly: leading white space, an optional sign, then
+// decimal digits, clamped to the long range; with no digits, 0 and *end = p.
+// Replaces strtol and atol, which brought ~650 bytes of library (v34).
+long parseDecimal(const char *p, const char **end) {
+  const char *s = p;
+  while (*s == ' ' || (*s >= '\t' && *s <= '\r')) s++;
+  char sign = *s;
+  if (sign == '-' || sign == '+') s++;
+  const char *digits = s;
+  unsigned long v = 0;
+  for (; *s >= '0' && *s <= '9'; s++) v = v <= 429496728UL ? v * 10 + (*s - '0') : 0xFFFFFFFFUL;
+  if (end) *end = s == digits ? p : s;
+  if (sign == '-') return v > 2147483648UL ? LONG_MIN : (long)(0UL - v);
+  return v > 2147483647UL ? LONG_MAX : (long)v;
+}
+
 // Parse a decimal char buffer to long (empty → 0).
 inline long bufToLong(const char *buf, int len) {
-  return len > 0 ? atol(buf) : 0;
+  return len > 0 ? parseDecimal(buf, nullptr) : 0;
 }
 
 // ── Non-blocking deferred reply ───────────────────────────────────────────────
@@ -1470,15 +1506,15 @@ void resetEepromDefaults() {
 // plain C string (no Arduino String / no heap).
 void restoreEepromFromPayload(const char *payload) {
   const char *p = payload;
-  char *end;
+  const char *end;
 
   // ── Parse homeOffset ─────────────────────────────────────────────────
-  long ho = strtol(p, &end, 10);
+  long ho = parseDecimal(p, &end);
   if (*end != ':') return;          // malformed
   p = end + 1;
 
   // ── Parse totalSteps ─────────────────────────────────────────────────
-  long ts = strtol(p, &end, 10);
+  long ts = parseDecimal(p, &end);
   if (*end != ':') return;          // malformed
   p = end + 1;
 
@@ -1493,10 +1529,10 @@ void restoreEepromFromPayload(const char *payload) {
 
   // ── Parse and write flap map entries: idx=pos,idx=pos,... ────────────
   while (*p) {
-    long flapIdx = strtol(p, &end, 10);
+    long flapIdx = parseDecimal(p, &end);
     if (end == p || *end != '=') break;   // no number, or missing '='
     p = end + 1;
-    long flapPos = strtol(p, &end, 10);
+    long flapPos = parseDecimal(p, &end);
     if (end == p) break;                   // no number after '='
     p = end;
 
@@ -1513,7 +1549,7 @@ void restoreEepromFromPayload(const char *payload) {
   // (older/hand-written payloads) → flap config left unchanged.
   if (*p == ':') {
     p++;
-    long cnt = strtol(p, &end, 10);
+    long cnt = parseDecimal(p, &end);
     if (end != p && cnt >= 1 && cnt <= MAX_FLAPS) {
       flapCount = (uint8_t)cnt;
       eepromUpdateByte(ADDR_FLAP_COUNT, flapCount);
@@ -1835,6 +1871,8 @@ void hallSelfTest() {
 //                 see their declaration.  An idle module drains the ring as
 //                 fast as the bus can fill it, so rxOverflows should only move
 //                 while the module is busy (moving, self-testing, writing EEPROM).
+//   --- appended in v34 -----------------------------------------------------
+//     blVersion   the bootloader's version (BUS-UPDATE.md), 0 if none
 void reportDiagnostics() {
   uint16_t vcc = readVccMillivolts();
   uint8_t  eeOk = eepromHealthOk() ? 1 : 0;
@@ -1848,7 +1886,23 @@ void reportDiagnostics() {
   n = appendNum(workBuf, n, rxOverflows, ':');
   n = appendNum(workBuf, n, bcastSent, ':');
   n = appendNum(workBuf, n, bcastLate, ':');
-  sendReply(appendNum(workBuf, n, crcErrors));
+  n = appendNum(workBuf, n, crcErrors, ':');
+  sendReply(appendNum(workBuf, n, bootloaderVersion()));
+}
+
+// Restart into the bootloader and have it wait for a firmware update
+// (BUS-UPDATE.md): leave the word it looks for in RAM, then reset.
+void enterBootloader() {
+  cli();
+  *(volatile uint16_t *)BOOTLOADER_REQUEST_AT = BOOTLOADER_REQUEST_MAGIC;
+  _PROTECTED_WRITE(RSTCTRL.SWRR, RSTCTRL_SWRE_bm);
+  for (;;) {}
+}
+
+// The bootloader's version, from its signature; 0 if there is none.
+uint8_t bootloaderVersion() {
+  const volatile uint8_t *sig = (const volatile uint8_t *)(MAPPED_PROGMEM_START + BOOTLOADER_SIGNATURE_AT);
+  return sig[0] == 'S' && sig[1] == 'F' && sig[2] == 'B' ? sig[3] : 0;
 }
 
 // ==========================================
@@ -2072,11 +2126,11 @@ void moveToChar(char targetChar) {
 //               SETUP
 // ==========================================
 void setup() {
-  // Capture WHY we just reset (RSTFR latches the cause) before anything clears
-  // it, then clear it by writing the bits back so the next reset's cause is
-  // recorded cleanly.  Reported later by the 'Q' diagnostics command.
-  resetCause = RSTCTRL.RSTFR;
-  RSTCTRL.RSTFR = resetCause;   // writing 1s clears the latched flags
+  // WHY we just reset, for the 'Q' diagnostics command.  megaTinyCore's
+  // startup has already read RSTFR, cleared it (so the next reset's cause is
+  // recorded cleanly) and left the bits in GPIOR0.  Until v34 this read RSTFR
+  // here, and so always reported 0.
+  resetCause = GPIOR0;
 
   // Disable the watchdog early in case we got here via a WDT reset (the flag
   // can leave the WDT running on some AVRs), then configure it fresh below.
@@ -2328,6 +2382,13 @@ void parseByte(char c) {
                 sendReply(appendNum(workBuf, n, hallActiveLevel == HIGH ? 1 : 0));
                 homeModule();   // re-home now that polarity may have changed
               }
+              parseState = 0;
+              break;
+            case 'U':
+              // Into the bootloader for an update over the bus (BUS-UPDATE.md).
+              // Only in a checksummed frame, so noise can never take a module
+              // off line; m*U takes every module.  Does not return.
+              if (replyCrc) enterBootloader();
               parseState = 0;
               break;
             case 'Q':

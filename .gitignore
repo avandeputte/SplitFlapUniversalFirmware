@@ -7,3 +7,4 @@
 .vscode/ipch
 compile_commands.json
 flasher/dist
+__pycache__/

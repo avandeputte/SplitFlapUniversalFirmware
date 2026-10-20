@@ -1,8 +1,47 @@
 # Release Notes
 
-Version history for the Split-Flap Universal Firmware. The firmware version is reported by the `v` and `A` commands (e.g. `m38v` → `m38v:33:38:<serial>`).
+Version history for the Split-Flap Universal Firmware. The firmware version is reported by the `v` and `A` commands (e.g. `m38v` → `m38v:34:38:<serial>`).
 
 All versions from v6 onward share the same EEPROM field layout, and every change to a reply has been **append-only** — new fields are added at the end so older controllers keep working. Upgrading preserves a module's ID and calibration **as long as the `EESAVE` fuse is set** (see [SETUP.md](SETUP.md) § "Write the fuses").
+
+---
+
+## v34 — Firmware updates over the bus
+
+v34 adds a bootloader, so from now on new firmware can reach a whole wall over the RS-485 bus instead of module by module over UPDI. Getting there takes **one last flash over UPDI per module**, which also sets a new fuse. The EEPROM layout is unchanged, and so is every reply except `Q`, which gains one field at the end and now reports the real reset cause.
+
+**Action required, once per module**
+- **Flash v34 over UPDI.** Its image now starts with the bootloader, which needs the fuse `BOOTEND = 0x04` to reserve its 1 KB:
+  - The [web flasher](https://avandeputte.github.io/SplitFlapUniversalFirmware/) sets the fuse from the image by itself.
+  - With PlatformIO, run `pio run -t fuses` once, then upload.
+  - With avrdude, [FLASHING.md](FLASHING.md) has the commands (`fuse8` is now `0x04`).
+- **The fuse must match the image.** A v34 image with `BOOTEND = 0x00`, or a v33 image with `0x04`, does not run. The web flasher picks the right value for whichever image it writes, so going back to v33 is safe with it too.
+
+**Updates over the bus**
+- **The bootloader** ([bootloader/](bootloader/)) takes the first 1 KB of flash. At every start it checks the firmware against its CRC (about 150 ms) and runs it.
+- **A new command, `U`**, restarts a module into update mode, and `m*U` does the whole wall. It is accepted only in a checksummed frame, so line noise can never trigger it.
+- **The procedure.** The gateway broadcasts the image page by page, about 40 s for any number of modules. It then asks each module what it is missing, resends just that, and tells the modules to go.
+- **[BUS-UPDATE.md](BUS-UPDATE.md)** has the protocol and the procedure. [`tools/busflash.py`](tools/busflash.py) is a working sender for a computer with a USB–RS485 adapter.
+- **Every release now includes `firmware-update.bin`**, the part of the image sent over the bus.
+- **Safety:**
+  - A module never runs a partial image. An update that stops part way, power cut included, leaves it waiting in update mode for the image.
+  - Every page is read back after it is written.
+  - The final check needs every page plus a CRC match.
+  - The bootloader never writes EEPROM, so IDs and calibration are safe.
+  - It never touches its own section.
+  - It answers only when asked by its own ID.
+
+**Diagnostics**
+- **`Q` appends `:<blVersion>`**, the bootloader's version, or 0 if the module has none. Older controllers ignore it.
+- **`Q` reports the real reset cause.** It has read `0` since it was added: megaTinyCore's startup clears the reset flags before the firmware's `setup()` runs. The firmware now reads the copy the core leaves for it.
+
+**Build**
+- **Layout.** The firmware is linked at `0x0400`, behind the bootloader, and may use up to 15,358 bytes.
+  - `firmware.hex` is the whole image: bootloader, firmware, and the image CRC in the last two bytes.
+  - A post-build step (`bootloader/merge.py`) puts it together, so `pio run -t upload` and avrdude write all of it.
+- **`strtol` and `atol` are gone.** A 14-line parser gives the same results on all of 2 million test strings, edge cases included, and saves about 650 bytes. Flash use is 14,671 of 15,358 bytes (95.5%).
+- **Checked against v33** on a host simulation of the firmware: 8,000 randomised traffic runs, plain and checksummed, give identical replies with identical timing, apart from `Q`'s new field.
+- **The bootloader's own tests** cover every boot decision, faulty and hostile bus traffic, and power lost at every flash write of an update.
 
 ---
 
