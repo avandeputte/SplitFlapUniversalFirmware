@@ -61,16 +61,29 @@
   // (This flasher erases page by page, which never touches the EEPROM.)  Fuse 3
   // does not exist on this part.  SYSCFG0 is written last, after everything
   // else has gone right.
-  const FUSES = [
-    { number: 0, name: 'WDTCFG',  value: 0x00 },
-    { number: 1, name: 'BODCFG',  value: 0x54 },
-    { number: 2, name: 'OSCCFG',  value: 0x02 },
-    { number: 4, name: 'TCD0CFG', value: 0x00 },
-    { number: 6, name: 'SYSCFG1', value: 0x06 },
-    { number: 7, name: 'APPEND',  value: 0x00 },
-    { number: 8, name: 'BOOTEND', value: 0x00 },
-    { number: 5, name: 'SYSCFG0', value: 0xC5 },
-  ];
+  //
+  // BOOTEND depends on the image: from v35 on, an image starts with the 1 KB
+  // bootloader that takes updates over the bus, and needs BOOTEND = 0x04 (the
+  // firmware's interrupt vectors are then at 0x0400); older images need 0x00.
+  // An image has the bootloader if its signature ('S','F','B',version) is at
+  // the end of the boot section.
+  const BOOTLOADER_SIGNATURE_AT = 0x3FC;
+  function bootloaderVersion(firmware) {
+    const im = firmware.image, at = BOOTLOADER_SIGNATURE_AT;
+    return im[at] === 0x53 && im[at + 1] === 0x46 && im[at + 2] === 0x42 ? im[at + 3] : 0;
+  }
+  function fusesFor(firmware) {
+    return [
+      { number: 0, name: 'WDTCFG',  value: 0x00 },
+      { number: 1, name: 'BODCFG',  value: 0x54 },
+      { number: 2, name: 'OSCCFG',  value: 0x02 },
+      { number: 4, name: 'TCD0CFG', value: 0x00 },
+      { number: 6, name: 'SYSCFG1', value: 0x06 },
+      { number: 7, name: 'APPEND',  value: 0x00 },
+      { number: 8, name: 'BOOTEND', value: bootloaderVersion(firmware) ? 0x04 : 0x00 },
+      { number: 5, name: 'SYSCFG0', value: 0xC5 },
+    ];
+  }
   const FUSE_COUNT = 9;                    // fuse0..fuse8, read as one block
 
   const BAUD = 57600;                      // the speed avrdude uses with this flasher
@@ -243,10 +256,8 @@
 
     // After a reset the chip spends its start-up time (SYSCFG1: 32 ms with
     // these fuses) loading its fuses and lock bits, and reads as locked until
-    // then.  A key sent in that window is used up when the start-up ends, so
-    // KEY_STATUS can read clear for a key that worked: wait for the chip to
-    // have started before sending one or trusting its status.  A chip still
-    // locked once it has had ample time is really locked.
+    // then.  Wait for that before trusting its status.  A chip still locked
+    // once it has had ample time is really locked.
     async waitStarted() {
       const deadline = Date.now() + 500;
       for (;;) {
@@ -263,25 +274,23 @@
       }
     }
 
-    // The chip starts again in programming mode if the key went in just
-    // before, and leaves programming mode if not.
-    async reset() {
-      await this.stcs(ASI_RESET_REQ, RESET_REQ_VALUE);
-      await this.stcs(ASI_RESET_REQ, 0x00);
-      return this.waitStarted();
-    }
-
+    // The key goes in while the chip is held in reset: no firmware runs until
+    // the release, so none can reset the chip and use the key up before it
+    // is checked (a firmware in a watchdog loop does exactly that).  The
+    // release then starts the chip, with the key, in programming mode.
     async enterProgMode() {
-      let status = await this.waitStarted();
-      if (status & SYS_STATUS_LOCKSTATUS) throw lockedError();
-      if (status & SYS_STATUS_NVMPROG) return;
+      if ((await this.ldcs(ASI_SYS_STATUS)) & SYS_STATUS_NVMPROG) {   // already there?
+        const status = await this.waitStarted();
+        if ((status & SYS_STATUS_NVMPROG) && !(status & SYS_STATUS_LOCKSTATUS)) return;
+      }
       const key = KEY_NVMPROG.split('').reverse().map((ch) => ch.charCodeAt(0));
+      await this.stcs(ASI_RESET_REQ, RESET_REQ_VALUE);
       await this.send([SYNC, KEY | KEY_64_BITS]);
       await this.send(key);
-      if (!((await this.ldcs(ASI_KEY_STATUS)) & KEY_STATUS_NVMPROG)) {
-        throw new FlasherError('The chip did not accept the programming key.');
-      }
-      status = await this.reset();
+      const accepted = (await this.ldcs(ASI_KEY_STATUS)) & KEY_STATUS_NVMPROG;
+      await this.stcs(ASI_RESET_REQ, 0x00);
+      if (!accepted) throw new FlasherError('The chip did not accept the programming key.');
+      const status = await this.waitStarted();
       if (status & SYS_STATUS_LOCKSTATUS) throw lockedError();
       if (!(status & SYS_STATUS_NVMPROG)) throw new FlasherError('The chip did not enter programming mode.');
     }
@@ -456,7 +465,8 @@
       on.step('fuses', 'Checking the fuses');
       const before = await updi.readFuses();
       result.fusesBefore = Array.from(before);
-      const wrong = FUSES.filter((f) => before[f.number] !== f.value);
+      const fuses = fusesFor(firmware);
+      const wrong = fuses.filter((f) => before[f.number] !== f.value);
       if (wrong.length) {
         let expected = Uint8Array.from(before);
         for (const f of wrong) {
@@ -529,7 +539,7 @@
     }
   }
 
-  const api = { CHIP, FUSES, Updi, FlasherError, parseIntelHex, toIntelHex, describeEeprom, flashModule };
+  const api = { CHIP, Updi, FlasherError, parseIntelHex, toIntelHex, describeEeprom, bootloaderVersion, fusesFor, flashModule };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   else root.SplitFlapUpdi = api;
 })(typeof window !== 'undefined' ? window : globalThis);

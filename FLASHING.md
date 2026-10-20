@@ -63,14 +63,14 @@ avrdude -c serialupdi -p attiny1616 -P PORT -b 57600 \
   -U fuse5:w:0xC5:m \
   -U fuse6:w:0x06:m \
   -U fuse7:w:0x00:m \
-  -U fuse8:w:0x00:m \
+  -U fuse8:w:0x04:m \
   -U lock:w:0xC5:m
 ```
 
 Windows, one line:
 
 ```
-avrdude -c serialupdi -p attiny1616 -P COM5 -b 57600 -U fuse0:w:0x00:m -U fuse1:w:0x54:m -U fuse2:w:0x02:m -U fuse4:w:0x00:m -U fuse5:w:0xC5:m -U fuse6:w:0x06:m -U fuse7:w:0x00:m -U fuse8:w:0x00:m -U lock:w:0xC5:m
+avrdude -c serialupdi -p attiny1616 -P COM5 -b 57600 -U fuse0:w:0x00:m -U fuse1:w:0x54:m -U fuse2:w:0x02:m -U fuse4:w:0x00:m -U fuse5:w:0xC5:m -U fuse6:w:0x06:m -U fuse7:w:0x00:m -U fuse8:w:0x04:m -U lock:w:0xC5:m
 ```
 
 Each fuse ends with `1 byte written, 1 verified`. What they set:
@@ -84,10 +84,10 @@ Each fuse ends with `1 byte written, 1 verified`. What they set:
 | `fuse5` SYSCFG0 | `0xC5` | **EEPROM retained across flashes** (`EESAVE`), UPDI pin left as UPDI. |
 | `fuse6` SYSCFG1 | `0x06` | Start-up delay. |
 | `fuse7` APPEND | `0x00` | No application data section. |
-| `fuse8` BOOTEND | `0x00` | No bootloader section. |
+| `fuse8` BOOTEND | `0x04` | 1 KB boot section, for the bootloader that takes updates over the bus (v35 and later). **To flash v35 or older, use `0x00`**: the fuse must match the image, or the module does not run. |
 | `lock` | `0xC5` | Unlocked. |
 
-These are the same values `platformio.ini` writes with `pio run -t fuses`. If a future release changes a fuse, the release notes will say so.
+These are the same values `platformio.ini` writes with `pio run -t fuses`. If a future release changes a fuse, the release notes will say so: v35 changed `fuse8`.
 
 ## Step 2: write the firmware
 
@@ -95,7 +95,7 @@ These are the same values `platformio.ini` writes with `pio run -t fuses`. If a 
 avrdude -c serialupdi -p attiny1616 -P PORT -b 57600 -U flash:w:firmware.hex:i
 ```
 
-Run it from the folder where you saved `firmware.hex`, or give the full path to the file. It takes about 25 seconds and ends with a line like `16244 bytes of flash verified` (the exact number depends on the release). The module restarts on the new firmware immediately.
+Run it from the folder where you saved `firmware.hex`, or give the full path to the file. From v35 the file holds the bootloader as well as the firmware, and this writes both. It takes about 25 seconds and ends with a line like `16244 bytes of flash verified` (the exact number depends on the release). The module restarts on the new firmware immediately.
 
 ## Step 3, optional: confirm the settings survived
 
@@ -107,7 +107,7 @@ This prints the module's EEPROM as hex. The first value should be `0x5d` (settin
 
 ## Doing a whole wall
 
-Repeat for each module: connect the three wires, Step 1, Step 2, disconnect, next. Once a module has the right fuses, later firmware updates need only Step 2. On the bus afterwards, `m<ID>v` reports the firmware version so you can confirm every module took the update.
+Repeat for each module: connect the three wires, Step 1, Step 2, disconnect, next. Once a module has the right fuses, later firmware updates need only Step 2. From v35 they do not need the flasher at all: they can go over the bus, to the whole wall at once ([BUS-UPDATE.md](BUS-UPDATE.md)). On the bus afterwards, `m<ID>v` reports the firmware version so you can confirm every module took the update.
 
 ## Troubleshooting
 

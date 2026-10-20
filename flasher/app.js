@@ -51,8 +51,10 @@
   function loadFirmware(label, text) {
     const parsed = U.parseIntelHex(text, U.CHIP.flashSize);
     firmware = { label, parsed };
-    $('fw-summary').textContent =
-      `${label}: ${parsed.length.toLocaleString()} bytes of the ${U.CHIP.name}'s ${U.CHIP.flashSize.toLocaleString()}.`;
+    const bl = U.bootloaderVersion(parsed);
+    $('fw-summary').textContent = bl
+      ? `${label}, with the bootloader (version ${bl}) that takes later updates over the bus.`
+      : `${label}: ${parsed.length.toLocaleString()} bytes of the ${U.CHIP.name}'s ${U.CHIP.flashSize.toLocaleString()}.`;
     $('fw-summary').className = '';
     log(`Firmware: ${label}, ${parsed.length} bytes`);
     refresh();
