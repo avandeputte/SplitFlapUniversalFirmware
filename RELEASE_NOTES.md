@@ -21,7 +21,7 @@ v35 adds a bootloader, so from now on new firmware can reach a whole wall over t
 - **The bootloader** ([bootloader/](bootloader/)) takes the first 1 KB of flash. At every start it checks the firmware against its CRC (about 150 ms) and runs it.
 - **A new command, `U`**, restarts a module into update mode, and `m*U` does the whole wall. It is accepted only in a checksummed frame, so line noise can never trigger it.
 - **The procedure.** The gateway broadcasts the image page by page, about 40 s for any number of modules. It then asks each module what it is missing, resends just that, and tells the modules to go.
-- **[BUS-UPDATE.md](BUS-UPDATE.md)** has the protocol and the procedure. [`tools/busflash.py`](tools/busflash.py) is a working sender for a computer with a USB–RS485 adapter.
+- **[BUS-UPDATE.md](BUS-UPDATE.md)** has the protocol and the procedure. [`tools/busflash.py`](tools/busflash.py) is a reference sender, for a computer with a USB–RS485 adapter.
 - **Every release now includes `firmware-update.bin`**, the part of the image sent over the bus.
 - **Safety:**
   - A module never runs a partial image. An update that stops part way, power cut included, leaves it waiting in update mode for the image.
@@ -30,10 +30,14 @@ v35 adds a bootloader, so from now on new firmware can reach a whole wall over t
   - The bootloader never writes EEPROM, so IDs and calibration are safe.
   - It never touches its own section.
   - It answers only when asked by its own ID.
+- **Not yet tried on a real bus.** On modules, the bootloader's start-up check works, and so does its fall-back to update mode when the image is broken. The update itself has so far run only on a host simulation of the chip, so try the first one on a single module. A module that does not finish an update is either back on its old firmware or waiting in update mode, and a UPDI flash always recovers it.
 
 **Diagnostics**
 - **`Q` appends `:<blVersion>`**, the bootloader's version, or 0 if the module has none. Older controllers ignore it.
 - **`Q` reports the real reset cause.** It has read `0` since it was added: megaTinyCore's startup clears the reset flags before the firmware's `setup()` runs. The firmware now reads the copy the core leaves for it.
+
+**Web flasher**
+- **It now gets into a module whose firmware keeps restarting the chip.** It sends the programming key while it holds the chip in reset. Before, a firmware that restarted the chip every few milliseconds could use the key up before the flasher confirmed it, and the flash failed.
 
 **Build**
 - **Layout.** The firmware is linked at `0x0400`, behind the bootloader, and may use up to 15,358 bytes.

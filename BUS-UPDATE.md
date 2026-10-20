@@ -2,7 +2,7 @@
 
 From v35 every module carries a bootloader: 1 KB at the start of its flash that can replace the firmware with an image sent over the RS-485 bus. A gateway, or a computer with a USB–RS485 adapter, can then update a whole wall at once in under a minute, without touching a module.
 
-This page describes the protocol and the procedure for whoever implements the sender. [`tools/busflash.py`](tools/busflash.py) is a working reference, and [`bootloader/`](bootloader/) holds the bootloader's source, build and tests.
+This page describes the protocol and the procedure for whoever implements the sender. [`tools/busflash.py`](tools/busflash.py) is a reference sender, and [`bootloader/`](bootloader/) holds the bootloader's source, build and tests.
 
 ## Getting the bootloader onto a module
 
