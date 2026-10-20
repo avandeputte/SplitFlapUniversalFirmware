@@ -256,10 +256,8 @@
 
     // After a reset the chip spends its start-up time (SYSCFG1: 32 ms with
     // these fuses) loading its fuses and lock bits, and reads as locked until
-    // then.  A key sent in that window is used up when the start-up ends, so
-    // KEY_STATUS can read clear for a key that worked: wait for the chip to
-    // have started before sending one or trusting its status.  A chip still
-    // locked once it has had ample time is really locked.
+    // then.  Wait for that before trusting its status.  A chip still locked
+    // once it has had ample time is really locked.
     async waitStarted() {
       const deadline = Date.now() + 500;
       for (;;) {
@@ -276,25 +274,23 @@
       }
     }
 
-    // The chip starts again in programming mode if the key went in just
-    // before, and leaves programming mode if not.
-    async reset() {
-      await this.stcs(ASI_RESET_REQ, RESET_REQ_VALUE);
-      await this.stcs(ASI_RESET_REQ, 0x00);
-      return this.waitStarted();
-    }
-
+    // The key goes in while the chip is held in reset: no firmware runs until
+    // the release, so none can reset the chip and use the key up before it
+    // is checked (a firmware in a watchdog loop does exactly that).  The
+    // release then starts the chip, with the key, in programming mode.
     async enterProgMode() {
-      let status = await this.waitStarted();
-      if (status & SYS_STATUS_LOCKSTATUS) throw lockedError();
-      if (status & SYS_STATUS_NVMPROG) return;
+      if ((await this.ldcs(ASI_SYS_STATUS)) & SYS_STATUS_NVMPROG) {   // already there?
+        const status = await this.waitStarted();
+        if ((status & SYS_STATUS_NVMPROG) && !(status & SYS_STATUS_LOCKSTATUS)) return;
+      }
       const key = KEY_NVMPROG.split('').reverse().map((ch) => ch.charCodeAt(0));
+      await this.stcs(ASI_RESET_REQ, RESET_REQ_VALUE);
       await this.send([SYNC, KEY | KEY_64_BITS]);
       await this.send(key);
-      if (!((await this.ldcs(ASI_KEY_STATUS)) & KEY_STATUS_NVMPROG)) {
-        throw new FlasherError('The chip did not accept the programming key.');
-      }
-      status = await this.reset();
+      const accepted = (await this.ldcs(ASI_KEY_STATUS)) & KEY_STATUS_NVMPROG;
+      await this.stcs(ASI_RESET_REQ, 0x00);
+      if (!accepted) throw new FlasherError('The chip did not accept the programming key.');
+      const status = await this.waitStarted();
       if (status & SYS_STATUS_LOCKSTATUS) throw lockedError();
       if (!(status & SYS_STATUS_NVMPROG)) throw new FlasherError('The chip did not enter programming mode.');
     }
