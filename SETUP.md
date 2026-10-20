@@ -151,13 +151,13 @@ You don't need hardware connected to *build* — this is a good first check that
   ========================= [SUCCESS] ... =========================
   ```
 
-> **Heads-up:** the firmware fills ~96% of the 15 KB it has; the chip's other 1 KB holds the bootloader (v34+). That's expected. The build then merges the bootloader into `firmware.hex` (the `Image:` line), so an upload writes both. If you add code and it overflows ("region `text' overflowed"), see [ARCHITECTURE.md → Memory strategy](ARCHITECTURE.md#memory-strategy).
+> **Heads-up:** the firmware fills ~96% of the 15 KB it has; the chip's other 1 KB holds the bootloader (v35+). That's expected. The build then merges the bootloader into `firmware.hex` (the `Image:` line), so an upload writes both. If you add code and it overflows ("region `text' overflowed"), see [ARCHITECTURE.md → Memory strategy](ARCHITECTURE.md#memory-strategy).
 
 ---
 
 ## 9. Write the fuses — once per chip
 
-Before the **first** upload to a given chip, write its fuses. This configures the clock, brown-out, UPDI pin, the 1 KB boot section for the bootloader (`BOOTEND`, since v34), and — most importantly — the **`EESAVE`** fuse that **preserves each module's ID, calibration, and flap set across future reflashes**. This is the PlatformIO equivalent of the Arduino IDE's *Burn Bootloader*.
+Before the **first** upload to a given chip, write its fuses. This configures the clock, brown-out, UPDI pin, the 1 KB boot section for the bootloader (`BOOTEND`, since v35), and — most importantly — the **`EESAVE`** fuse that **preserves each module's ID, calibration, and flap set across future reflashes**. This is the PlatformIO equivalent of the Arduino IDE's *Burn Bootloader*.
 
 - **In VSCode:** PlatformIO sidebar → *Project Tasks → ATtiny1616 → Platform → **Set Fuses*** (it may be labelled *Set Fuses* / *Burn Bootloader* / *fuses* depending on version).
 - **Or from the terminal:**

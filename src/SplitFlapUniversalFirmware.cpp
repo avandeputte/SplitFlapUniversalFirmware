@@ -100,10 +100,10 @@
 //            went out after their slot (held back by carrier sense, a frame
 //            still arriving, or a busy module); crcErrors = checksummed frames
 //            for this module dropped because the checksum failed (see
-//            CHECKSUMS).  Appended in v34: blVersion = the version of the
+//            CHECKSUMS).  Appended in v35: blVersion = the version of the
 //            bootloader that takes updates over the bus (BUS-UPDATE.md).
-//            (Before v34 resetCause always read 0: megaTinyCore's startup
-//            clears RSTFR before setup() runs.  It is right from v34 on.)
+//            (Before v35 resetCause always read 0: megaTinyCore's startup
+//            clears RSTFR before setup() runs.  It is right from v35 on.)
 //  M[<n>]    Mechanical self-test (DIRECT-ADDRESSED ONLY, drives the motor):
 //              m<id>M:<code>:<min>:<max>:<spreadTenthsPct>:<gateActive>:<gateSpan>:<avgMagnetWidth>:<r1>,<r2>,...,<rN>\n
 //            Samples several revolutions and compares them.  Bare 'm<id>M' uses
@@ -185,7 +185,7 @@
 //            grows with slot index, so it spreads replies apart, never together.
 //  F         Factory-reset EEPROM defaults (preserves module ID and magic byte)
 //  U         Restart into the bootloader to take a firmware update over the
-//            bus (v34; BUS-UPDATE.md).  Only in a checksummed frame (see
+//            bus (v35; BUS-UPDATE.md).  Only in a checksummed frame (see
 //            CHECKSUMS): a plain 'U' is ignored, so line noise can never take a
 //            module off line.  m*U takes every module.  No reply: from then on
 //            the bootloader answers, in its own protocol.
@@ -508,7 +508,7 @@ void gotoRawStep(long target);
 
 // ── Firmware version ──────────────────────────────────────────────────────────
 // Returned by the 'v', 'A', and mXA commands.  Bump when you change behaviour.
-const char FIRMWARE_VERSION[] = "34";
+const char FIRMWARE_VERSION[] = "35";
 
 // ── Pin assignments ───────────────────────────────────────────────────────────
 // RS-485 transceiver
@@ -529,7 +529,7 @@ const int RS485_DE = 2;     // driver enable       (HIGH = transmit)
 #define HALL_DEFAULT_ACTIVE LOW
 
 // ── Bootloader (bootloader/, BUS-UPDATE.md) ───────────────────────────────────
-// Since v34 this firmware starts at 0x0400, behind the 1 KB bootloader that
+// Since v35 this firmware starts at 0x0400, behind the 1 KB bootloader that
 // takes updates over the bus (fuse BOOTEND = 0x04).  These must match
 // bootloader/bootloader.c.
 #define BOOTLOADER_REQUEST_AT     0x3F00   // RAM word it checks after a software reset,
@@ -900,7 +900,7 @@ inline void bufClear(char *buf, int &len) { len = 0; buf[0] = '\0'; }
 
 // strtol(p, &end, 10), exactly: leading white space, an optional sign, then
 // decimal digits, clamped to the long range; with no digits, 0 and *end = p.
-// Replaces strtol and atol, which brought ~650 bytes of library (v34).
+// Replaces strtol and atol, which brought ~650 bytes of library (v35).
 long parseDecimal(const char *p, const char **end) {
   const char *s = p;
   while (*s == ' ' || (*s >= '\t' && *s <= '\r')) s++;
@@ -1871,7 +1871,7 @@ void hallSelfTest() {
 //                 see their declaration.  An idle module drains the ring as
 //                 fast as the bus can fill it, so rxOverflows should only move
 //                 while the module is busy (moving, self-testing, writing EEPROM).
-//   --- appended in v34 -----------------------------------------------------
+//   --- appended in v35 -----------------------------------------------------
 //     blVersion   the bootloader's version (BUS-UPDATE.md), 0 if none
 void reportDiagnostics() {
   uint16_t vcc = readVccMillivolts();
@@ -2128,7 +2128,7 @@ void moveToChar(char targetChar) {
 void setup() {
   // WHY we just reset, for the 'Q' diagnostics command.  megaTinyCore's
   // startup has already read RSTFR, cleared it (so the next reset's cause is
-  // recorded cleanly) and left the bits in GPIOR0.  Until v34 this read RSTFR
+  // recorded cleanly) and left the bits in GPIOR0.  Until v35 this read RSTFR
   // here, and so always reported 0.
   resetCause = GPIOR0;
 

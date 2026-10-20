@@ -1,18 +1,18 @@
 # Updating firmware over the bus
 
-From v34 every module carries a bootloader: 1 KB at the start of its flash that can replace the firmware with an image sent over the RS-485 bus. A gateway, or a computer with a USB–RS485 adapter, can then update a whole wall at once in under a minute, without touching a module.
+From v35 every module carries a bootloader: 1 KB at the start of its flash that can replace the firmware with an image sent over the RS-485 bus. A gateway, or a computer with a USB–RS485 adapter, can then update a whole wall at once in under a minute, without touching a module.
 
 This page describes the protocol and the procedure for whoever implements the sender. [`tools/busflash.py`](tools/busflash.py) is a working reference, and [`bootloader/`](bootloader/) holds the bootloader's source, build and tests.
 
 ## Getting the bootloader onto a module
 
-Installing it takes one last flash over UPDI per module, with the [web flasher](https://avandeputte.github.io/SplitFlapUniversalFirmware/) or as in [FLASHING.md](FLASHING.md). Any v34 or later image includes the bootloader, and the fuse that reserves its section is `BOOTEND = 0x04`, which the web flasher sets by itself. After that, every update can go over the bus.
+Installing it takes one last flash over UPDI per module, with the [web flasher](https://avandeputte.github.io/SplitFlapUniversalFirmware/) or as in [FLASHING.md](FLASHING.md). Any v35 or later image includes the bootloader, and the fuse that reserves its section is `BOOTEND = 0x04`, which the web flasher sets by itself. After that, every update can go over the bus.
 
-A module has the bootloader if its firmware is v34 or later. The last field of the `Q` diagnostics reply gives the bootloader's version, which is 0 if there is none.
+A module has the bootloader if its firmware is v35 or later. The last field of the `Q` diagnostics reply gives the bootloader's version, which is 0 if there is none.
 
 ## The image
 
-Every release from v34 includes `firmware-update.bin`, 15,360 bytes holding the flash from `0x0400` to `0x3FFF`:
+Every release from v35 includes `firmware-update.bin`, 15,360 bytes holding the flash from `0x0400` to `0x3FFF`:
 
 - **Pages:** the image is 240 pages of 64 bytes, numbered 16 to 255. Page *n* is the 64 bytes at offset (*n* − 16) × 64 in the file.
 - **Image CRC:** the file's last two bytes, big-endian. It is the CRC-16 of everything before them.
@@ -74,7 +74,7 @@ A page frame is 144 characters, so the 240 pages take about 40 seconds with thei
 
 ## The procedure
 
-1. **Check the modules.** `m<id>v` gives each module's firmware version. Only modules on v34 or later have the bootloader.
+1. **Check the modules.** `m<id>v` gives each module's firmware version. Only modules on v35 or later have the bootloader.
 2. **Into update mode.** Send `m*U` for every module, or `m<id>U` for one, **as a checksummed frame**: `~HHHHm*U\n`, where `HHHH` is the CRC of `m*U` in upper-case hex. A plain `U` is ignored, so line noise can never take a module off line. Older firmware ignores `U` too. There is no reply.
 3. **Confirm.** `S` to each module. An answer with reason 1 means it is waiting.
 4. **The pages.** Send pages 16 to 255 to `FF`, with the gaps above. Every module in update mode takes them.

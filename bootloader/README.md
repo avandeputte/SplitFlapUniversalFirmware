@@ -1,6 +1,6 @@
 # Bootloader
 
-The 1 KB program at the start of every module's flash, from v34 on. It starts the firmware, and, when asked, replaces it with an image sent over the RS-485 bus. [BUS-UPDATE.md](../BUS-UPDATE.md) describes the protocol and the update procedure. This page is for working on the bootloader itself.
+The 1 KB program at the start of every module's flash, from v35 on. It starts the firmware, and, when asked, replaces it with an image sent over the RS-485 bus. [BUS-UPDATE.md](../BUS-UPDATE.md) describes the protocol and the update procedure. This page is for working on the bootloader itself.
 
 **The bootloader can only be replaced over UPDI.** Every module carries the version it was last flashed with over UPDI, and an update over the bus never touches it. A change here therefore reaches a wall only by visiting every module with the web flasher. Make one only for a good reason, keep the protocol backward compatible, and bump `BL_VERSION`.
 
@@ -37,7 +37,7 @@ In update mode it drives only the bus pins: TX, and DE while it answers a status
 
 ## Why it is built the way it is
 
-- **1 KB, in C.** An earlier version, all in assembly, fitted 512 bytes, but only after giving up checks. 1 KB keeps the checks, keeps the code readable, and lets the host tests run the real `bootloader.c`. v34 removed `strtol` and `atol` from the firmware, which paid for most of the extra space.
+- **1 KB, in C.** An earlier version, all in assembly, fitted 512 bytes, but only after giving up checks. 1 KB keeps the checks, keeps the code readable, and lets the host tests run the real `bootloader.c`. v35 removed `strtol` and `atol` from the firmware, which paid for most of the extra space.
 - **Every page is read back after it is written.** A page that reads back wrong does not count, and the gateway sends it again.
 - **`G` needs every page, then the CRC.** A CRC-16 check alone would accept a mixed image about once in 65,536 tries; requiring every page to have been read back first rules that out.
 - **CRC-16/CCITT-FALSE**, the same CRC as the firmware's checksummed frames, so a gateway needs only one CRC routine.

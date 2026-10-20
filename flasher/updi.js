@@ -62,7 +62,7 @@
   // does not exist on this part.  SYSCFG0 is written last, after everything
   // else has gone right.
   //
-  // BOOTEND depends on the image: from v34 on, an image starts with the 1 KB
+  // BOOTEND depends on the image: from v35 on, an image starts with the 1 KB
   // bootloader that takes updates over the bus, and needs BOOTEND = 0x04 (the
   // firmware's interrupt vectors are then at 0x0400); older images need 0x00.
   // An image has the bootloader if its signature ('S','F','B',version) is at

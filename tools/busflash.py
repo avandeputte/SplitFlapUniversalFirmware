@@ -6,8 +6,8 @@
     python3 tools/busflash.py PORT firmware-update.bin --all --id 3 --id 4
 
 PORT is a USB-RS485 adapter on the modules' bus (with nothing else talking;
-unplug the gateway).  firmware-update.bin comes with every release from v34.
-The modules must already run v34 or later, which installed the bootloader.
+unplug the gateway).  firmware-update.bin comes with every release from v35.
+The modules must already run v35 or later, which installed the bootloader.
 
 --id N   a module to update; give it once per module.  The modules are asked
          for their status one by one, so every module must be named.
@@ -143,7 +143,7 @@ def main():
     for mid in ids:
         st = status(bus, mid)
         if not st:
-            sys.exit(f'module {mid} does not answer in its bootloader: is it running v34 or later?')
+            sys.exit(f'module {mid} does not answer in its bootloader: is it running v35 or later?')
         print(f'  module {mid}: bootloader {st["version"]}')
 
     todo = {mid: list(range(FIRST_PAGE, LAST_PAGE + 1)) for mid in ids}

@@ -1,21 +1,21 @@
 # Release Notes
 
-Version history for the Split-Flap Universal Firmware. The firmware version is reported by the `v` and `A` commands (e.g. `m38v` → `m38v:34:38:<serial>`).
+Version history for the Split-Flap Universal Firmware. The firmware version is reported by the `v` and `A` commands (e.g. `m38v` → `m38v:35:38:<serial>`).
 
 All versions from v6 onward share the same EEPROM field layout, and every change to a reply has been **append-only** — new fields are added at the end so older controllers keep working. Upgrading preserves a module's ID and calibration **as long as the `EESAVE` fuse is set** (see [SETUP.md](SETUP.md) § "Write the fuses").
 
 ---
 
-## v34 — Firmware updates over the bus
+## v35 — Firmware updates over the bus
 
-v34 adds a bootloader, so from now on new firmware can reach a whole wall over the RS-485 bus instead of module by module over UPDI. Getting there takes **one last flash over UPDI per module**, which also sets a new fuse. The EEPROM layout is unchanged, and so is every reply except `Q`, which gains one field at the end and now reports the real reset cause.
+v35 adds a bootloader, so from now on new firmware can reach a whole wall over the RS-485 bus instead of module by module over UPDI. Getting there takes **one last flash over UPDI per module**, which also sets a new fuse. The EEPROM layout is unchanged, and so is every reply except `Q`, which gains one field at the end and now reports the real reset cause.
 
 **Action required, once per module**
-- **Flash v34 over UPDI.** Its image now starts with the bootloader, which needs the fuse `BOOTEND = 0x04` to reserve its 1 KB:
+- **Flash v35 over UPDI.** Its image now starts with the bootloader, which needs the fuse `BOOTEND = 0x04` to reserve its 1 KB:
   - The [web flasher](https://avandeputte.github.io/SplitFlapUniversalFirmware/) sets the fuse from the image by itself.
   - With PlatformIO, run `pio run -t fuses` once, then upload.
   - With avrdude, [FLASHING.md](FLASHING.md) has the commands (`fuse8` is now `0x04`).
-- **The fuse must match the image.** A v34 image with `BOOTEND = 0x00`, or a v33 image with `0x04`, does not run. The web flasher picks the right value for whichever image it writes, so going back to v33 is safe with it too.
+- **The fuse must match the image.** A v35 image with `BOOTEND = 0x00`, or an older one with `0x04`, does not run. The web flasher picks the right value for whichever image it writes, so going back to an older release is safe with it too.
 
 **Updates over the bus**
 - **The bootloader** ([bootloader/](bootloader/)) takes the first 1 KB of flash. At every start it checks the firmware against its CRC (about 150 ms) and runs it.
