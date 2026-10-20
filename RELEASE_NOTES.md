@@ -1,8 +1,29 @@
 # Release Notes
 
-Version history for the Split-Flap Universal Firmware. The firmware version is reported by the `v` and `A` commands (e.g. `m38v` → `m38v:33:38:<serial>`).
+Version history for the Split-Flap Universal Firmware. The firmware version is reported by the `v` and `A` commands (e.g. `m38v` → `m38v:34:38:<serial>`).
 
 All versions from v6 onward share the same EEPROM field layout, and every change to a reply has been **append-only** — new fields are added at the end so older controllers keep working. Upgrading preserves a module's ID and calibration **as long as the `EESAVE` fuse is set** (see [SETUP.md](SETUP.md) § "Write the fuses").
+
+---
+
+## v34 — The watchdog really is 2 seconds
+
+A one-line fix, and very likely the end of modules that never answer a dump. No fuse change and no EEPROM-layout change, and every reply is unchanged: just upload.
+
+**The bug**
+- **The firmware asked for a 2 s watchdog with avr-libc's `WDTO_2S`.** On this chip, `wdt_enable()` puts that constant straight into the watchdog's period field, where 7 means 512 cycles. The watchdog has really been running at **0.512 s**.
+- **One thing took longer than that without resetting it: a reply.** A reply is sent in one go after a single reset, at about 1 ms a byte. **Any reply longer than about 490 bytes reset the module part way through.**
+- **In practice, the dumps of a well-calibrated module.** The `A` and `d` dumps of a module with many calibrated flap positions run past that: a fully calibrated module's `A` dump is about 630 bytes. Such a module:
+  - answers every short command, but never a dump;
+  - counts one more boot (`bootCount` in `Q`) for every attempt;
+  - "recovers" when its calibration is erased, because that makes the dump short again.
+
+  That is the gateway's soak-test report: two modules on a 64-module wall that never answered a dump.
+
+**The fix**
+- **The chip's own constant.** The watchdog now uses `WDT_PERIOD_2KCLK_gc`: 2.048 s, as the code and the docs always said. The longest possible reply, about 0.73 s, is well inside it.
+- **Checked on a module:** the watchdog register now reads `0x09` (2K cycles), where v33 left `0x07` (512 cycles).
+- **A hang is still caught**, in 2 s instead of 0.5 s.
 
 ---
 
@@ -41,7 +62,7 @@ No fuse change and no EEPROM-layout change: just upload. Every reply to a plain 
 - **Out-of-range flap positions are refused** by `w` and by the `mXW` restore (which leaves such entries uncalibrated). A negative position in a restore payload used to be stored as e.g. `65368`. The module never used such a value for a move, so nothing on the display changes.
 - **A corrupt flap-character cell holding a line terminator is sent as `?`** in the `A` dump instead of ending the frame early.
 - **A dump can never be truncated**, and the build now proves it: the longest possible `A` line is ~700 bytes against a 720-byte buffer, checked at compile time.
-- **Every transmission starts with a watchdog reset.** The longest reply, a full `A` dump, takes ~0.75 s, well inside the 2 s watchdog.
+- **Every transmission starts with a watchdog reset.** The longest reply, a full `A` dump, takes ~0.75 s, well inside the 2 s watchdog. (It wasn't: the watchdog really ran at 0.5 s until v34 fixed it.)
 
 **Build**
 - **printf is gone.** The dumps were the only formatted output; two small helpers now produce them byte for byte as `snprintf` did, so the ~1 KB printf library and the `-Wl,-u,vfprintf -lprintf_min` flags are out of `platformio.ini`. The build no longer depends on which printf variant a toolchain would pick.

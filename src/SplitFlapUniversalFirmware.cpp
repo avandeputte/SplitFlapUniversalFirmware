@@ -496,7 +496,7 @@ void gotoRawStep(long target);
 
 // ── Firmware version ──────────────────────────────────────────────────────────
 // Returned by the 'v', 'A', and mXA commands.  Bump when you change behaviour.
-const char FIRMWARE_VERSION[] = "33";
+const char FIRMWARE_VERSION[] = "34";
 
 // ── Pin assignments ───────────────────────────────────────────────────────────
 // RS-485 transceiver
@@ -551,8 +551,13 @@ const unsigned long CSMA_LISTEN_MS = 20UL;
 // ── Watchdog timeout ──────────────────────────────────────────────────────────
 // Must exceed the longest blocking section between wdt_reset() calls.  Long
 // motor moves call wdt_reset() internally, so this only needs to cover a normal
-// loop iteration with margin.
-#define WDT_TIMEOUT WDTO_2S
+// loop iteration and the longest reply (a full 'A' dump, ~0.75 s) with margin.
+// It is the chip's own period constant, not avr-libc's WDTO_2S: on this chip
+// wdt_enable() writes its argument straight into WDT.CTRLA, where WDTO_2S (7)
+// selects 512 cycles, 0.512 s.  Until v34 that is what the watchdog ran at, so
+// any reply longer than ~490 bytes (the 'A' or 'd' dump of a module with many
+// calibrated flaps) reset the module part way through.
+#define WDT_TIMEOUT WDT_PERIOD_2KCLK_gc    // 2.048 s
 
 // ── EEPROM health-check cadence ───────────────────────────────────────────────
 // The 'Q' diagnostics include a write-read-verify of the scratch cell.  Each
