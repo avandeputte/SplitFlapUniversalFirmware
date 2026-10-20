@@ -977,6 +977,8 @@ With PlatformIO: run `pio run -t fuses` **once per chip** (the equivalent of the
 | v8 or v9 | `0x5E` | Fields loaded, magic rewritten to `0x5D` |
 | Blank chip | `0xFF` | Full default init, ID set to 255 |
 
+> **Upgrading to v34:** just upload; no fuse change, same EEPROM layout, every reply unchanged. It fixes the watchdog, which ran at 0.5 s instead of 2 s. A module therefore restarted part way through any reply longer than about 490 bytes, which means the `A` and `d` dumps of a well-calibrated module never arrived. See [RELEASE_NOTES.md](RELEASE_NOTES.md).
+
 > **Upgrading to v33:** just upload; no fuse change, same EEPROM layout, and every reply to a plain message is unchanged except `Q`, which gains four counters at the end (older controllers ignore them). Messages may now carry an optional [checksum](#checksums-optional-v33). Behaviour differences a controller may notice: a frame sent shortly after a busy module's receive buffer overflowed is now answered instead of discarded, broadcast replies wait for a quiet bus, out-of-range flap positions are refused by `w` and `mXW`, and `+` with no index is ignored. See [RELEASE_NOTES.md](RELEASE_NOTES.md).
 
 > **Upgrading to v32:** the fuses now enable the brown-out detector, so **run `pio run -t fuses` once on every module** in addition to the upload (see [SETUP.md](SETUP.md)). Fuse writes do not erase EEPROM. Nothing else changes: same commands, same replies, same EEPROM layout.
