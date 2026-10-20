@@ -5,6 +5,10 @@
 # Runs on every published release, when the flasher itself changes on main
 # (rebuilt with the latest release), and by hand (Actions → Web flasher → Run
 # workflow).  Needs Settings → Pages → Source set to "GitHub Actions".
+#
+# Pages keeps the first deployment of each commit and quietly ignores later
+# ones (it names a deployment after its commit), so running this again for a
+# commit that is already deployed changes nothing.
 name: Web flasher
 
 on:
@@ -27,8 +31,38 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  build:
+  # Which release to bundle, if any.  A push to main whose firmware version is
+  # not released yet is the merge of a release's pull request: deploying it
+  # now would leave the previous firmware on that commit for good.  Leave the
+  # commit to the release, whose own run follows with the new firmware.
+  pick:
     runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.pick.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: pick
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          if [ -z "$TAG" ]; then TAG=$(gh release view --json tagName --jq .tagName); fi
+          VERSION=$(sed -n 's/^const char FIRMWARE_VERSION\[\] = "\([0-9]*\)";.*/\1/p' src/SplitFlapUniversalFirmware.cpp)
+          if [ -z "$VERSION" ]; then
+            echo "::error::FIRMWARE_VERSION not found in src/SplitFlapUniversalFirmware.cpp"; exit 1
+          fi
+          if [ "$GITHUB_EVENT_NAME" = push ] && [ "$VERSION" != "$TAG" ]; then
+            echo "::notice::v$VERSION is not released yet (the latest release is $TAG): its release deploys this commit"
+          else
+            echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: pick
+    if: needs.pick.outputs.tag != ''
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ needs.pick.outputs.tag }}
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
@@ -37,11 +71,7 @@ jobs:
       - name: Download the release firmware
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.event.release.tag_name }}
-        run: |
-          if [ -z "$TAG" ]; then TAG=$(gh release view --json tagName --jq .tagName); fi
-          echo "TAG=$TAG" >> "$GITHUB_ENV"
-          gh release download "$TAG" --pattern firmware.hex --dir build
+        run: gh release download "$TAG" --pattern firmware.hex --dir build
       - name: Build the page
         run: node flasher/build.mjs build/firmware.hex "$TAG" flasher/dist
       - name: Attach flasher.html to the release
