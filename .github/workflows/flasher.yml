@@ -1,0 +1,65 @@
+# Builds the web flasher (flasher/) with the release's firmware.hex bundled in,
+# publishes it on GitHub Pages, and attaches the same single file to the
+# release as flasher.html, for people who would rather run it from disk.
+#
+# Runs on every published release, when the flasher itself changes on main
+# (rebuilt with the latest release), and by hand (Actions → Web flasher → Run
+# workflow).  Needs Settings → Pages → Source set to "GitHub Actions".
+name: Web flasher
+
+on:
+  release:
+    types: [published]
+  push:
+    branches: [main]
+    paths:
+      - 'flasher/**'
+      - '.github/workflows/flasher.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write     # attach flasher.html to the release
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - name: Download the release firmware
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          if [ -z "$TAG" ]; then TAG=$(gh release view --json tagName --jq .tagName); fi
+          echo "TAG=$TAG" >> "$GITHUB_ENV"
+          gh release download "$TAG" --pattern firmware.hex --dir build
+      - name: Build the page
+        run: node flasher/build.mjs build/firmware.hex "$TAG" flasher/dist
+      - name: Attach flasher.html to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp flasher/dist/index.html build/flasher.html
+          gh release upload "$TAG" build/flasher.html --clobber
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: flasher/dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v5
