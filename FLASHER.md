@@ -95,10 +95,10 @@ Write the fuses once per chip, then upload:
 
 ```
 pio run -t fuses
-pio run -t upload
+pio run -t upload          # a v4 board; pio run -e v5 -t upload for a v5
 ```
 
-See [SETUP.md](SETUP.md) for the full toolchain walkthrough. No PlatformIO? [FLASHING.md](FLASHING.md) does the same two steps with avrdude alone and the prebuilt `firmware.hex` from the latest release.
+See [SETUP.md](SETUP.md) for the full toolchain walkthrough. No PlatformIO? [FLASHING.md](FLASHING.md) does the same two steps with avrdude alone and the prebuilt `.hex` for the module's board (`firmware-v4.hex` or `firmware-v5.hex`) from the latest release.
 
 ### If it says `UPDI link initialization failed`
 

@@ -1,6 +1,6 @@
 # Setup Guide — Build & Flash the Firmware (VSCode + PlatformIO)
 
-> **Only want to flash a release?** You do not need any of this. [FLASHING.md](FLASHING.md) flashes the prebuilt `firmware.hex` with avrdude alone, and [FLASHER.md](FLASHER.md) shows the programmer hardware. This guide is for building the firmware from source.
+> **Only want to flash a release?** You do not need any of this. [FLASHING.md](FLASHING.md) flashes the prebuilt `.hex` for your board with avrdude alone, and [FLASHER.md](FLASHER.md) shows the programmer hardware. This guide is for building the firmware from source.
 
 This is a step-by-step walkthrough for someone starting from nothing: install VSCode, install PlatformIO, get the code, and build and upload the firmware to an ATtiny1616 module.
 
@@ -143,15 +143,17 @@ The rest of `platformio.ini` is already configured for this board (ATtiny1616, 1
 
 You don't need hardware connected to *build* — this is a good first check that the toolchain works.
 
-- **In VSCode:** click the **Build** button (the ✓ checkmark) in the bottom status bar, or press `Ctrl+Alt+B`. You can also open the PlatformIO sidebar → *Project Tasks → ATtiny1616 → General → Build*.
+> **Two driver boards (v36+).** `platformio.ini` has one environment per board: **`v4`**, Adam's board and earlier (the default), and **`v5`**, whose RS-485 transceiver is on the hardware USART ([README → Driver boards](README.md#driver-boards-v36)). Each builds into its own folder, `.pio/build/v4/` or `.pio/build/v5/`, with that board's bootloader merged in. A plain build or upload uses `v4`; add `-e v5` for a v5 board, or pick `v5` in VSCode's PlatformIO environment switcher (status bar) or under *Project Tasks → v5*. An image runs only on its own board: on the other, it waits in its bootloader, and the right image has to go on over UPDI.
+
+- **In VSCode:** click the **Build** button (the ✓ checkmark) in the bottom status bar, or press `Ctrl+Alt+B`. You can also open the PlatformIO sidebar → *Project Tasks → v4 → General → Build*.
 - A terminal panel opens and shows the compile. Success ends with something like:
   ```
   RAM:   [=====     ]  52.3% (used 1071 bytes from 2048 bytes)
-  Flash: [==========]  95.5% (used 14671 bytes from 15358 bytes)
+  Flash: [==========]  96.0% (used 14749 bytes from 15356 bytes)
   ========================= [SUCCESS] ... =========================
   ```
 
-> **Heads-up:** the firmware fills ~96% of the 15 KB it has; the chip's other 1 KB holds the bootloader (v35+). That's expected. The build then merges the bootloader into `firmware.hex` (the `Image:` line), so an upload writes both. If you add code and it overflows ("region `text' overflowed"), see [ARCHITECTURE.md → Memory strategy](ARCHITECTURE.md#memory-strategy).
+> **Heads-up:** the v4 firmware fills ~96% of the 15 KB it has (the v5 build, with no software serial port, ~89%); the chip's other 1 KB holds the bootloader (v35+). That's expected. The build then merges the bootloader into `firmware.hex` (the `Image:` line), so an upload writes both. If you add code and it overflows ("region `text' overflowed"), see [ARCHITECTURE.md → Memory strategy](ARCHITECTURE.md#memory-strategy).
 
 ---
 
@@ -159,11 +161,12 @@ You don't need hardware connected to *build* — this is a good first check that
 
 Before the **first** upload to a given chip, write its fuses. This configures the clock, brown-out, UPDI pin, the 1 KB boot section for the bootloader (`BOOTEND`, since v35), and — most importantly — the **`EESAVE`** fuse that **preserves each module's ID, calibration, and flap set across future reflashes**. This is the PlatformIO equivalent of the Arduino IDE's *Burn Bootloader*.
 
-- **In VSCode:** PlatformIO sidebar → *Project Tasks → ATtiny1616 → Platform → **Set Fuses*** (it may be labelled *Set Fuses* / *Burn Bootloader* / *fuses* depending on version).
+- **In VSCode:** PlatformIO sidebar → *Project Tasks → v4 → Platform → **Set Fuses*** (it may be labelled *Set Fuses* / *Burn Bootloader* / *fuses* depending on version).
 - **Or from the terminal:**
   ```bash
   pio run -t fuses
   ```
+  The fuses are the same on both boards.
 
 You only need to do this **once per physical chip**. After that, every upload keeps EEPROM intact.
 
@@ -177,15 +180,16 @@ You only need to do this **once per physical chip**. After that, every upload ke
 
 With the module powered and the programmer connected:
 
-- **In VSCode:** click the **Upload** button (the → arrow) in the bottom status bar, or press `Ctrl+Alt+U`, or use *Project Tasks → ATtiny1616 → General → Upload*.
+- **In VSCode:** click the **Upload** button (the → arrow) in the bottom status bar, or press `Ctrl+Alt+U`, or use *Project Tasks → v4 → General → Upload* (or *v5* for a v5 board).
 - **Or from the terminal:**
   ```bash
-  pio run -t upload
+  pio run -t upload          # a v4 board
+  pio run -e v5 -t upload    # a v5 board
   ```
 
 This builds (if needed) and flashes over SerialUPDI. Success ends with an avrdude "X bytes of flash verified" and `[SUCCESS]`.
 
-Every module runs the **same** binary — there is nothing to change per-module before flashing. Bus IDs and the flap set are assigned later over the RS-485 bus (see the README).
+Every module on the same board runs the **same** binary — there is nothing to change per-module before flashing. Bus IDs and the flap set are assigned later over the RS-485 bus (see the README).
 
 ---
 
@@ -194,7 +198,7 @@ Every module runs the **same** binary — there is nothing to change per-module 
 Once flashed and connected to your RS-485 bus, you can confirm the version over the bus (see [README.md](README.md) for the full protocol and the `provision.py` tool):
 
 ```
-m<ID>v\n      → m<ID>v:33:<ID>:<serialNumber>\n
+m<ID>v\n      → m<ID>v:36:<ID>:<serialNumber>:<board>\n
 ```
 
 A freshly flashed, never-provisioned module advertises its serial number every ~10–15 seconds and has bus ID 255 until you provision it.
@@ -207,8 +211,8 @@ After the one-time setup, the normal loop is just two clicks (or two commands):
 
 | Action | VSCode button | CLI |
 |---|---|---|
-| Compile | Build ✓ | `pio run` |
-| Flash | Upload → | `pio run -t upload` |
+| Compile | Build ✓ | `pio run` (v4), `pio run -e v5` |
+| Flash | Upload → | `pio run -t upload` (v4), `pio run -e v5 -t upload` |
 | Write fuses (once per new chip) | *Set Fuses* task | `pio run -t fuses` |
 | Clean build artifacts | *Clean* task | `pio run -t clean` |
 
@@ -221,9 +225,10 @@ You do **not** re-run the fuses step on subsequent uploads to the same chip.
 If you prefer the terminal, you can install just the PlatformIO Core CLI (`pio`) without VSCode — see <https://docs.platformio.org/en/latest/core/installation/index.html>. Then, from the folder containing `platformio.ini`:
 
 ```bash
-pio run                 # build
-pio run -t fuses        # write fuses (once per chip)
-pio run -t upload       # build + flash
+pio run                 # build (v4; -e v5 for a v5 board, -e v4 -e v5 for both)
+pio run -t fuses        # write fuses (once per chip; the same on both boards)
+pio run -t upload       # build + flash a v4 board
+pio run -e v5 -t upload # build + flash a v5 board
 pio device list         # list serial ports (to fill in upload_port)
 ```
 

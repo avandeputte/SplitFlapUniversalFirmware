@@ -1,6 +1,8 @@
-# Builds the web flasher (flasher/) with the release's firmware.hex bundled in,
+# Builds the web flasher (flasher/) with the release's firmware bundled in,
 # publishes it on GitHub Pages, and attaches the same single file to the
 # release as flasher.html, for people who would rather run it from disk.
+# Since v36 a release has one image per driver board (firmware-v4.hex and
+# firmware-v5.hex) and the page carries both; up to v35 it had one, firmware.hex.
 #
 # Runs on every published release, when the flasher itself changes on main
 # (rebuilt with the latest release), and by hand (Actions → Web flasher → Run
@@ -71,9 +73,9 @@ jobs:
       - name: Download the release firmware
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release download "$TAG" --pattern firmware.hex --dir build
+        run: gh release download "$TAG" --pattern 'firmware*.hex' --dir build
       - name: Build the page
-        run: node flasher/build.mjs build/firmware.hex "$TAG" flasher/dist
+        run: node flasher/build.mjs "$TAG" build/firmware*.hex --out flasher/dist
       - name: Attach flasher.html to the release
         env:
           GH_TOKEN: ${{ github.token }}

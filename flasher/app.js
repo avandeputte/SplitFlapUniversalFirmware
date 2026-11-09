@@ -3,7 +3,9 @@
 // =============================================================================
 // Wires index.html to the programming core (updi.js) and the browser's serial
 // port (webserial.js).  The firmware comes bundled (firmware.js, written by
-// build.mjs) or from a file the user picks.
+// build.mjs), one image for each driver board, or from a file the user picks,
+// which is for one board only.  The flasher reads each module's board and
+// writes the image for it.
 // =============================================================================
 (function () {
   'use strict';
@@ -13,7 +15,7 @@
 
   const STEPS = [
     ['connect', 'Connecting to the chip'],
-    ['identify', 'Identifying the chip'],
+    ['identify', 'Identifying the chip and its board'],
     ['backup', 'Backing up the module\'s settings'],
     ['fuses', 'Checking the fuses'],
     ['write', 'Writing the firmware'],
@@ -23,7 +25,7 @@
   ];
   const RESTORE_COMMAND = 'avrdude -c serialupdi -p attiny1616 -P PORT -b 57600 -U eeprom:w:FILE:i';
 
-  let firmware = null;      // { label, parsed }
+  let firmware = null;      // { label, images: { <board>: parsed image } }
   let transport = null;
   let busy = false;
 
@@ -48,30 +50,46 @@
   }
 
   // ── Firmware ──────────────────────────────────────────────────────────────
-  function loadFirmware(label, text) {
-    const parsed = U.parseIntelHex(text, U.CHIP.flashSize);
-    firmware = { label, parsed };
-    const bl = U.bootloaderVersion(parsed);
-    $('fw-summary').textContent = bl
-      ? `${label}, with the bootloader (version ${bl}) that takes later updates over the bus.`
-      : `${label}: ${parsed.length.toLocaleString()} bytes of the ${U.CHIP.name}'s ${U.CHIP.flashSize.toLocaleString()}.`;
+  // Each image says which board it is for (U.imageBoard), so a file's name
+  // never decides it.
+  function loadFirmware(label, hexes) {
+    const images = {};
+    for (const text of hexes) {
+      const parsed = U.parseIntelHex(text, U.CHIP.flashSize);
+      const board = U.imageBoard(parsed);
+      if (board !== 4 && board !== 5) throw new Error(`it is for a board this page does not know (v${board}).`);
+      if (images[board]) throw new Error(`it has two images for the v${board} board.`);
+      images[board] = parsed;
+    }
+    firmware = { label, images };
+    const boards = Object.keys(images);
+    const lines = boards.map((b) => {
+      const im = images[b], bl = U.bootloaderVersion(im);
+      return `v${b} board${b === '4' ? ' (and earlier)' : ''}: ${im.length.toLocaleString()} bytes` +
+        (bl ? `, with the bootloader (version ${bl}) that takes later updates over the bus` : '');
+    });
+    $('fw-summary').replaceChildren(
+      el('span', { text: boards.length > 1
+        ? `${label}, for both driver boards. Each module gets the image for its own board.`
+        : `${label}, for the v${boards[0]} board only: a module on the other board is left untouched.` }),
+      el('ul', { class: 'small muted', style: 'margin:4px 0 0;padding-left:20px' }, lines.map((t) => el('li', { text: t }))));
     $('fw-summary').className = '';
-    log(`Firmware: ${label}, ${parsed.length} bytes`);
+    for (const t of lines) log(`Firmware: ${label}, ${t}`);
     refresh();
   }
 
   if (window.BUNDLED_FIRMWARE) {
-    try { loadFirmware(`Firmware v${window.BUNDLED_FIRMWARE.version} (included with this page)`, window.BUNDLED_FIRMWARE.hex); }
+    try { loadFirmware(`Firmware v${window.BUNDLED_FIRMWARE.version} (included with this page)`, window.BUNDLED_FIRMWARE.hexes); }
     catch (err) { $('fw-summary').textContent = `The included firmware is damaged: ${err.message}`; }
   } else {
-    $('fw-summary').textContent = 'Choose the firmware.hex file from a release.';
+    $('fw-summary').textContent = 'Choose the firmware file for your board from a release: firmware-v4.hex or firmware-v5.hex.';
   }
 
   $('fw-file').addEventListener('change', async (ev) => {
     const file = ev.target.files[0];
     if (!file) return;
     try {
-      loadFirmware(file.name, await file.text());
+      loadFirmware(file.name, [await file.text()]);
     } catch (err) {
       firmware = null;
       $('fw-summary').textContent = `${file.name} can't be used: ${err.message}`;
@@ -147,6 +165,7 @@
     } else if (s) {
       rows.push(['Settings', 'none yet: a blank chip']);
     }
+    if (result.board) rows.push(['Driver board', `v${result.board}`]);
     if (result.serial) rows.push(['Serial number', result.serial]);
     if (result.fusesBefore) {
       rows.push(['Fuses', result.fusesWritten.length
@@ -161,6 +180,7 @@
     const backupCell = backup ? el('a', { href: backup.url, download: backup.name, text: 'Download' }) : '—';
     $('session').prepend(el('tr', {}, [
       el('td', { text: moduleName(result.settings) }),
+      el('td', { text: result.board ? `v${result.board}` : '—' }),
       el('td', { class: 'serial', text: result.serial || '—' }),
       el('td', { text: ok ? '✓ flashed' : '✕ failed' }),
       el('td', {}, [backupCell]),
@@ -180,7 +200,7 @@
     const started = Date.now();
     log('— Flashing —');
     try {
-      const result = await U.flashModule(transport, firmware.parsed, {
+      const result = await U.flashModule(transport, firmware.images, {
         step(id) {
           if (current) markStep(current, 'done');
           current = id;
@@ -203,7 +223,7 @@
       outcome.replaceChildren(
         el('div', { class: 'notice ok' }, [
           el('p', {}, [el('strong', { text: `${moduleName(result.settings)} is flashed and verified` }),
-            ` (${result.bytes.toLocaleString()} bytes, ${secs} s)` +
+            ` with the v${result.board} board's image (${result.bytes.toLocaleString()} bytes, ${secs} s)` +
             (result.eepromRestored ? '. Its settings changed during flashing and were written back from the backup.' :
               result.settings && result.settings.initialised ? ', and it kept its settings.' : '.')]),
         ]),

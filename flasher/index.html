@@ -72,6 +72,7 @@
   details pre { background: var(--code); border-radius: 8px; padding: 10px; overflow: auto; max-height: 260px;
                 font: 0.8rem/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; }
   footer { color: var(--muted); font-size: 0.85rem; margin-top: 24px; }
+  #fw-summary { margin: 0 0 8px; }
   .hidden { display: none !important; }
 </style>
 </head>
@@ -86,7 +87,7 @@
 
   <section class="card" aria-labelledby="fw-title">
     <h2 id="fw-title">Firmware</h2>
-    <p id="fw-summary" class="muted">No firmware loaded yet.</p>
+    <div id="fw-summary" class="muted">No firmware loaded yet.</div>
     <div class="row small">
       <label for="fw-file">Use a different firmware file:</label>
       <input id="fw-file" type="file" accept=".hex,text/plain">
@@ -124,7 +125,7 @@
   <section id="session-card" class="card hidden" aria-labelledby="session-title">
     <h2 id="session-title">Flashed this session</h2>
     <table>
-      <thead><tr><th>Module</th><th>Serial number</th><th>Result</th><th>Settings backup</th></tr></thead>
+      <thead><tr><th>Module</th><th>Board</th><th>Serial number</th><th>Result</th><th>Settings backup</th></tr></thead>
       <tbody id="session"></tbody>
     </table>
   </section>

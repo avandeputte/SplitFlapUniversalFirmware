@@ -2,6 +2,15 @@
 
 The 1 KB program at the start of every module's flash, from v35 on. It starts the firmware, and, when asked, replaces it with an image sent over the RS-485 bus. [BUS-UPDATE.md](../BUS-UPDATE.md) describes the protocol and the update procedure. This page is for working on the bootloader itself.
 
+Since v36 there are two builds, one per driver board, from the same source (`SF_BOARD`, as for the firmware). They differ only in how they reach the RS-485 transceiver:
+
+| Build | Board | `BL_VERSION` | The bus |
+|---|---|---|---|
+| `bootloader.hex` | v4 (and earlier) | 1 | bit-banged on PA5/PA7, DE on PA6 (`uart.S`). Unchanged since v35. |
+| `bootloader-v5.hex` | v5 | 2 | USART0 on its alternate pins, PA1/PA2, polled; the USART drives DE on PA4 (RS-485 mode). Its status reply ends with the board, 5. |
+
+The v5 build reads the PC0 strap (grounded on a v5) before it touches a pin. On any other board it drives nothing and spins until the watchdog restarts the chip: there its pins are the v4 board's IO header. Only a UPDI flash of the wrong image could put it there.
+
 **The bootloader can only be replaced over UPDI.** Every module carries the version it was last flashed with over UPDI, and an update over the bus never touches it. A change here therefore reaches a wall only by visiting every module with the web flasher. Make one only for a good reason, keep the protocol backward compatible, and bump `BL_VERSION`.
 
 ## Files
@@ -9,10 +18,10 @@ The 1 KB program at the start of every module's flash, from v35 on. It starts th
 | File | What it is |
 |---|---|
 | `bootloader.c` | Everything but the bit timing: the boot decision, frames, pages, status, the image check. |
-| `uart.S` | The bus at 9600 baud, bit-banged on the firmware's RS-485 pins, in assembly so every bit takes a known number of cycles. |
-| `bootloader.hex` | The build that goes onto modules. Committed, so every firmware build merges exactly these bytes. |
-| `build.py` | Builds `bootloader.hex` with PlatformIO's avr-gcc; `--test` also runs the host tests. |
-| `merge.py` | The firmware build's last step (`extra_scripts` in `platformio.ini`). It puts the bootloader and the image CRC around the firmware in `firmware.hex`, and writes `firmware-update.bin`. |
+| `uart.S` | The v4 bus at 9600 baud, bit-banged on the RS-485 pins, in assembly so every bit takes a known number of cycles. The v5 build uses only its `half_bit` delay. |
+| `bootloader.hex`, `bootloader-v5.hex` | The builds that go onto modules, v4 and v5. Committed, so every firmware build merges exactly these bytes. |
+| `build.py` | Builds both with PlatformIO's avr-gcc; `--test` also runs the host tests on both. |
+| `merge.py` | The firmware build's last step (`extra_scripts` in `platformio.ini`). It puts the board's bootloader, the board tag and the image CRC around the firmware in `firmware.hex`, and writes `firmware-update.bin`. |
 | `test/` | The host tests: `bootloader.c` on a simulated chip. |
 
 ## Flash layout
@@ -21,7 +30,9 @@ The 1 KB program at the start of every module's flash, from v35 on. It starts th
 |---|---|
 | `0x0000`–`0x03FB` | The bootloader. It runs at every reset. |
 | `0x03FC`–`0x03FF` | Its signature: `S` `F` `B` and its version. The web flasher sets `BOOTEND` from it, and the firmware reports it as the last field of `Q`. |
-| `0x0400`–`0x3FFD` | The firmware, linked to start here (`board_build.text_section_start`). |
+| `0x0400`–`0x3FFB` | The firmware, linked to start here (`board_build.text_section_start`). |
+| `0x3FFC` | The board the image is for, 4 or 5 (v36 and later; `0xFF` before). The firmware compares it with nothing: it reads the strap itself. Senders and the web flasher read it from the file. |
+| `0x3FFD` | Reserved, `0xFF`. `merge.py` makes it `0xFE` in the one image in 65,536 whose CRC would otherwise come out `0xFFFF`, which means "no image". |
 | `0x3FFE`–`0x3FFF` | The image CRC, CRC-16/CCITT-FALSE of `0x0400`–`0x3FFD`, big-endian. |
 
 The fuse `BOOTEND = 0x04` makes `0x0000`–`0x03FF` the boot section. The chip then puts the firmware's interrupt vectors at `0x0400`, and refuses writes to the boot section from code running in it.
@@ -33,7 +44,7 @@ The fuse `BOOTEND = 0x04` makes `0x0000`–`0x03FF` the boot section. The chip t
 3. **The firmware.** If the stored image CRC is not `0xFFFF` and matches the CRC of `0x0400`–`0x3FFD`, it jumps to `0x0400`. This check takes about 150 ms.
 4. **Otherwise**, update mode, until a good image arrives.
 
-In update mode it drives only the bus pins: TX, and DE while it answers a status request. The watchdog runs with an 8-second timeout, and every good frame resets it. RAM use is a 110-byte state block at `0x3800` plus a few bytes of stack.
+In update mode it drives only the bus pins: TX, and DE while it answers a status request. On the v5 board, the USART raises and drops DE itself. The watchdog runs with an 8-second timeout, and every good frame resets it. RAM use is a 110-byte state block at `0x3800` plus a few bytes of stack.
 
 ## Why it is built the way it is
 
@@ -48,7 +59,9 @@ In update mode it drives only the bus pins: TX, and DE while it answers a status
 python3 bootloader/build.py --test
 ```
 
-The build refuses code that would run into the signature. It also refuses any compiler warning. `-fno-move-loop-invariants` saves about 20 bytes with this compiler (avr-gcc 7.3). Commit `bootloader.hex` together with the source change.
+This builds both boards and, with `--test`, runs the host tests on both. The build refuses code that would run into the signature. It also refuses any compiler warning. `-fno-move-loop-invariants` saves about 20 bytes with this compiler (avr-gcc 7.3). Commit both `.hex` files together with the source change.
+
+**Space.** The v4 build is 996 bytes of the 1,020 before the signature, and the v5 build 1,018: 2 bytes to spare. A change to the shared code has to fit the v5 build.
 
 ## Testing
 
@@ -61,3 +74,5 @@ The build refuses code that would run into the signature. It also refuses any co
 - power lost at every flash write of an update, before, during and after the write. Each time, the module comes back with either the old firmware or the new one, never a mix. When it can run neither, it waits for an update, and the next update completes.
 
 The bit timing in `uart.S` is not simulated. Its cycle counts are in its comments: 1,043 cycles a bit to receive and 1,046–1,047 to send, against 1,041.7 at 9600 baud, well inside what a UART tolerates.
+
+Neither are the v5 build's USART and strap: the tests run its logic, with the board byte in its status reply, on the same simulated bus. On v5 hardware it has so far been seen to check a firmware image and start it. It has not yet received an update.
