@@ -16,9 +16,10 @@
 //   read(count, timeoutMs)     resolves exactly `count` bytes, or rejects
 //   discardInput()
 //
-// flashModule() is the whole routine: identify the chip, back up its EEPROM,
-// put the fuses right, write and verify the flash, and check that the EEPROM
-// (the module's ID and calibration) came through untouched.
+// flashModule() is the whole routine: identify the chip and its driver board,
+// pick the image for that board, back up its EEPROM, put the fuses right,
+// write and verify the flash, and check that the EEPROM (the module's ID and
+// calibration) came through untouched.
 // =============================================================================
 (function (root) {
   'use strict';
@@ -85,6 +86,23 @@
     ];
   }
   const FUSE_COUNT = 9;                    // fuse0..fuse8, read as one block
+
+  // ── Driver boards ─────────────────────────────────────────────────────────
+  // From v36 there are two module boards, and an image runs only on its own:
+  // v4 (and earlier) has the RS-485 transceiver on PA5/PA7/PA6, v5 on the
+  // USART's PA1/PA2/PA4.  Each image names its board at 0x3FFC; one built
+  // before v36 has 0xFF there and is a v4 image, as every image then was.
+  // The v5 board grounds PC0, which is unconnected on v4: read with the
+  // pull-up, it is 0 on v5 and 1 on v4.  The firmware reads the same strap
+  // at start-up, so the flasher can never disagree with it about the board.
+  // PC0 is only ever read: as an output it would short the v5 board's strap.
+  const BOARD_TAG_AT = 0x3FFC;
+  const BOARD_DEFAULT = 4;
+  function imageBoard(firmware) {
+    const b = firmware.image[BOARD_TAG_AT];
+    return b === 0xFF ? BOARD_DEFAULT : b;
+  }
+  const VPORTC_IN = 0x000A, PORTC_PIN0CTRL = 0x0450, PULLUPEN = 0x08;
 
   const BAUD = 57600;                      // the speed avrdude uses with this flasher
   const REPLY_MS = 250;                    // a reply or an echo that has not come by then never will
@@ -334,6 +352,18 @@
 
     async readFuses() { return this.readBytes(CHIP.fuseBase, FUSE_COUNT); }
 
+    // The board, from the PC0 strap.  In programming mode the CPU is held, so
+    // nothing else touches the pin; the pull-up is switched off again after.
+    // As in the firmware, it is a v5 only if two reads both give 0.
+    async readBoard() {
+      await this.st(PORTC_PIN0CTRL, PULLUPEN);
+      await sleep(2);
+      const a = (await this.ld(VPORTC_IN)) & 0x01;
+      const b = (await this.ld(VPORTC_IN)) & 0x01;
+      await this.st(PORTC_PIN0CTRL, 0x00);
+      return a === 0 && b === 0 ? 5 : 4;
+    }
+
     async writeFuse(number, value) {
       const address = CHIP.fuseBase + number;
       // SYSCFG0 decides what the UPDI pin is.  A value that made it a GPIO or
@@ -430,10 +460,13 @@
   }
 
   // ── The whole routine ─────────────────────────────────────────────────────
-  // events: step(id, text), progress(done, total), backup(eeprom, settings,
-  // serial), log(text).  Resolves with what happened; rejects with a
-  // FlasherError (whose `result` holds what had happened by then).
-  async function flashModule(transport, firmware, events) {
+  // images: the firmware for each board, by board number ({ 4: …, 5: … });
+  // either may be missing, and a module whose board has none is refused
+  // before anything is written.  events: step(id, text), progress(done,
+  // total), backup(eeprom, settings, serial), log(text).  Resolves with what
+  // happened; rejects with a FlasherError (whose `result` holds what had
+  // happened by then).
+  async function flashModule(transport, images, events) {
     const on = Object.assign({ step() {}, progress() {}, backup() {}, log() {} }, events);
     const updi = new Updi(transport, on.log);
     const result = { fusesWritten: [], eepromRestored: false };
@@ -446,7 +479,7 @@
       await updi.enterProgMode();
       inProg = true;
 
-      on.step('identify', 'Identifying the chip');
+      on.step('identify', 'Identifying the chip and its board');
       const signature = await updi.readBytes(CHIP.sigrow, 3);
       if (!sameBytes(signature, CHIP.signature)) {
         throw new FlasherError(`This is not an ${CHIP.name} (signature ${Array.from(signature).map(hex2).join(' ')}).`);
@@ -455,6 +488,19 @@
       result.serial = Array.from(serial).map(hex2).join('');
       const lock = await updi.ld(CHIP.lockAddress);
       if (lock !== CHIP.unlocked) throw lockedError();
+
+      // Which board, and so which image: before the backup and the fuses, so
+      // that a module this page has no image for is left exactly as it was.
+      result.board = await updi.readBoard();
+      on.log(`Driver board: v${result.board} (PC0 ${result.board === 5 ? 'grounded' : 'open'})`);
+      const firmware = images[result.board];
+      if (!firmware) {
+        const other = Object.keys(images).map((b) => `v${b}`).join(' and ');
+        throw new FlasherError(`This module is a v${result.board} board, and the firmware loaded is for ${other} boards only.`,
+          `Nothing was written. Load the firmware for the v${result.board} board (firmware-v${result.board}.hex from a v36 or later release), ` +
+          'or use the flasher page of a release, which includes both.');
+      }
+      result.firmware = firmware;
 
       on.step('backup', 'Backing up the module\'s settings');
       const eeprom = await updi.readBytes(CHIP.eepromBase, CHIP.eepromSize);
@@ -539,7 +585,7 @@
     }
   }
 
-  const api = { CHIP, Updi, FlasherError, parseIntelHex, toIntelHex, describeEeprom, bootloaderVersion, fusesFor, flashModule };
+  const api = { CHIP, Updi, FlasherError, parseIntelHex, toIntelHex, describeEeprom, bootloaderVersion, imageBoard, fusesFor, flashModule };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   else root.SplitFlapUpdi = api;
 })(typeof window !== 'undefined' ? window : globalThis);

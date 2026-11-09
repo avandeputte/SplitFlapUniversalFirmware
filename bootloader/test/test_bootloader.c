@@ -154,7 +154,12 @@ static void requested(void) {
 }
 
 // ── the module's answers ─────────────────────────────────────────────────────
-typedef struct { uint8_t id, s, version, reason, flags, image[2], pages[32]; } reply_t;
+typedef struct {
+  uint8_t id, s, version, reason, flags, image[2], pages[32];
+#if SF_BOARD == 5
+  uint8_t board;                           // the v5 build's reply ends with its board
+#endif
+} reply_t;
 static double reply_at[64];                // when each reply decoded by replies() began
 
 // The status replies the module sent, decoded and checked; returns how many.
@@ -230,6 +235,9 @@ static void boot_decisions(void) {
         rep[0].s == 's' && rep[0].id == MODULE && rep[0].image[0] == 0xFF && rep[0].image[1] == 0xFF &&
         rep[0].flags == 0 && pages_missing(&rep[0], none) == LAST - FIRST + 1,
         "wrong status before any page (RAM was garbage)");
+#if SF_BOARD == 5
+  CHECK(rep[0].board == 5, "the v5 status does not end with board 5");
+#endif
   CHECK(chip.request == 0, "the request magic was not cleared");
 
   test("boot: a software reset without the magic, or the magic without one: the firmware starts");

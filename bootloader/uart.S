@@ -1,6 +1,10 @@
 ; =============================================================================
-; Split-Flap module bootloader: the bus at 9600 baud, 8N1, bit-banged
+; Split-Flap module bootloader: the bus at 9600 baud, 8N1, bit-banged (v4 board)
 ; =============================================================================
+; The v4 board's transceiver is on PA5/PA7, which the USART cannot reach, so
+; rx and tx bit-bang them.  The v5 board's is on the USART (bootloader.c);
+; its build keeps only half_bit from this file.
+;
 ; In assembly so that every bit takes a known number of cycles at 10 MHz:
 ; 1041.7 would be exact; these take 1043 to receive and 1046-1047 to send,
 ; well inside what a UART tolerates.  Called from bootloader.c (avr-gcc ABI:
@@ -22,6 +26,7 @@ half_bit:
         brne    1b
         ret
 
+#if SF_BOARD != 5
 ; Wait for a byte and return it in r24.  A start bit must still be low half a
 ; bit after its edge, so a glitch on an idle line is not taken for a byte.
 ; Returns once the stop bit has begun, so the caller has a bit's time before
@@ -60,3 +65,4 @@ tx:
         dec     r23
         brne    1b
         ret
+#endif

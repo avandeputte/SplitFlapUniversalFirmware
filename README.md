@@ -14,6 +14,7 @@ Firmware for a multi-module split-flap display where each character cell is an i
 
 - [Repository Contents](#repository-contents)
 - [Flashing the Firmware](#flashing-the-firmware)
+  - [Driver boards (v36+)](#driver-boards-v36)
 - [How It Works](#how-it-works)
   - [Module Identity and Provisioning](#module-identity-and-provisioning)
   - [Boot Sequence](#boot-sequence)
@@ -69,7 +70,7 @@ RELEASE_NOTES.md                    — Per-version change history
 
 The firmware targets the ATtiny1616 via the [megaTinyCore](https://github.com/SpenceKonde/megaTinyCore) platform, built and uploaded with **[PlatformIO](https://platformio.org/)** inside **VSCode** (or via the `pio` CLI). Programming is over **SerialUPDI** (a cheap USB-serial adapter), not a dedicated programmer.
 
-**Just want to flash a module? Use the [web flasher](https://avandeputte.github.io/SplitFlapUniversalFirmware/)** in Chrome or Edge: nothing to install. It writes the fuses a new chip needs, backs up each module's settings, flashes and verifies the current release, and checks the module kept its ID and calibration. For the same without a browser, [FLASHING.md](FLASHING.md) does it with avrdude and the `firmware.hex` attached to every release. **From v35, later updates can go over the bus:** that last flash installs a bootloader, and from then on the gateway updates the whole wall at once, with no module taken down ([BUS-UPDATE.md](BUS-UPDATE.md)). **Need a programmer? [FLASHER.md](FLASHER.md)** shows how to turn a CH340 USB-to-serial adapter into a SerialUPDI flasher with one diode. **Want to build the firmware yourself? Follow the full walkthrough in [SETUP.md](SETUP.md)** — it covers installing VSCode, installing PlatformIO, getting the code, and building/uploading from scratch.
+**Just want to flash a module? Use the [web flasher](https://avandeputte.github.io/SplitFlapUniversalFirmware/)** in Chrome or Edge: nothing to install. It writes the fuses a new chip needs, backs up each module's settings, flashes and verifies the current release, and checks the module kept its ID and calibration. For the same without a browser, [FLASHING.md](FLASHING.md) does it with avrdude and the `.hex` file for the module's board attached to every release. **From v35, later updates can go over the bus:** that last flash installs a bootloader, and from then on the gateway updates the whole wall at once, with no module taken down ([BUS-UPDATE.md](BUS-UPDATE.md)). **Need a programmer? [FLASHER.md](FLASHER.md)** shows how to turn a CH340 USB-to-serial adapter into a SerialUPDI flasher with one diode. **Want to build the firmware yourself? Follow the full walkthrough in [SETUP.md](SETUP.md)** — it covers installing VSCode, installing PlatformIO, getting the code, and building/uploading from scratch.
 
 Quick version, once your toolchain is set up:
 
@@ -84,11 +85,27 @@ Quick version, once your toolchain is set up:
    The same step enables the **brown-out detector at 2.6 V**. Earlier configurations left BOD disabled, which at 10 MHz let the chip run out of spec during every power ramp and could corrupt or misread EEPROM — the cause of modules "forgetting" their settings after a power cycle. **Modules whose fuses were written before this change need the fuses step run once more.** Writing fuses does not erase EEPROM, so IDs and calibration survive.
 4. Build and upload:
    ```bash
-   pio run -t upload
+   pio run -t upload          # a v4 board (the default)
+   pio run -e v5 -t upload    # a v5 board
    ```
-   In VSCode you can instead click the PlatformIO **Build** (✓) and **Upload** (→) buttons in the status bar.
+   In VSCode you can instead click the PlatformIO **Build** (✓) and **Upload** (→) buttons in the status bar; pick the `v5` environment for a v5 board.
 
-Every module runs the same firmware binary. IDs and the flap set are assigned at runtime via the bus — there is nothing to change before flashing.
+Every module on the same board runs the same firmware binary. IDs and the flap set are assigned at runtime via the bus — there is nothing to change before flashing.
+
+### Driver boards (v36+)
+
+Since v36 the firmware supports two driver boards. They differ only in where the RS-485 transceiver is:
+
+| Board | RS-485 pins | The bus | Release files |
+|---|---|---|---|
+| v4 (and earlier) | PA5 TX, PA7 RX, PA6 DE | bit-banged (SoftwareSerial): these are not USART pins | `firmware-v4.hex`, `firmware-update-v4.bin` |
+| v5 | PA1 TX, PA2 RX, PA4 DE | USART0 on its alternate pins | `firmware-v5.hex`, `firmware-update-v5.bin` |
+
+Everything else, from the motor to the EEPROM layout and the commands, is the same. Each board has its own image and its own bootloader, built from the same source (`pio run -e v4` or `-e v5`). Releases up to v35 have a single `firmware.hex`, for the v4.
+
+- **Telling them apart.** A v5 board grounds PC0, which a v4 leaves unconnected. The firmware reads it at every start, and reports its board as the last field of the [`v` reply](#v--report-firmware-version). The [web flasher](https://avandeputte.github.io/SplitFlapUniversalFirmware/) reads it too, and writes the matching image by itself.
+- **A wrong image never runs.** Sent over the bus, it is checked and started, and the firmware, finding itself on the other board, goes straight back to the bootloader without touching a bus pin. The module waits there for the right image. Flashed over UPDI, it brings the other board's bootloader as well, which cannot reach the transceiver: flash the right image over UPDI. (The v5 bootloader on a v4 drives nothing; the v4 bootloader on a v5 drives PA5 and PA6, two pins of its IO header.) The web flasher refuses to write the wrong one.
+- **Not yet tried:** on the v5, receiving commands and updates over the bus. On v5 modules the firmware has started and sent on the bus; v36 also runs on a v4.
 
 ---
 
@@ -515,16 +532,18 @@ Broadcast slot timing is the same as for `v` (see the note there), with a 700 ms
 
 #### `v` — Report firmware version
 
-Returns the firmware version, module ID, and ATtiny1616 serial number. Useful for verifying which version is running after an upgrade and for cross-referencing a provisioned ID back to a physical serial number.
+Returns the firmware version, module ID, ATtiny1616 serial number and driver board. Useful for verifying which version is running after an upgrade, for cross-referencing a provisioned ID back to a physical serial number, and for picking the right image for an update.
 
 **Response format:**
 ```
-m<ID>v:<version>:<moduleId>:<serialNumber>\n
+m<ID>v:<version>:<moduleId>:<serialNumber>:<board>\n
 ```
+
+`<board>` (v36+) is the [driver board](#driver-boards-v36): `4` or `5`. Firmware before v36 ends at the serial number, and runs only on a v4.
 
 **Examples:**
 ```
-m38v\n        → m38v:33:38:A3F24C0018E7D29B3F01\n
+m38v\n        → m38v:36:38:A3F24C0018E7D29B3F01:4\n
 m*v\n         → every provisioned module replies in sequence, each in its own slot
 m*v0-49\n     → only IDs 0–49 reply (poll the bus in retryable batches)
 ```
@@ -535,7 +554,7 @@ m*v0-49\n     → only IDs 0–49 reply (poll the bus in retryable batches)
 
 - **The clock starts at the broadcast's terminator.** A module schedules its slot when it parses the `\n` or `\r` that ends the query, or after 50 ms of silence if the query has none. A module that is busy when the query arrives (for example still turning its reel) parses it late and answers late by the same amount.
 - **Carrier sense (v33).** When its slot comes round, a module only transmits once the bus has been quiet for 20 ms. A slot that would land on another frame, such as a late neighbour or a controller that has already moved on, waits for the bus instead of destroying both frames. An on-time slot always sees that much quiet, so on a healthy bus nothing moves; the `Q` counter `bcastLate` shows how often a module had to wait.
-- **Later slots land later than nominal.** While bytes are on the bus, every module's millisecond clock runs about 15% slow: the software serial port masks interrupts for about 1 ms per byte, longer than the 0.82 ms clock tick, and a tick that falls in the same window as another is lost. A module therefore answers later than `lead-in + (id − lo) × slot` by roughly 15% of the reply traffic before its slot; in a 16-ID `m*A` batch of fully calibrated modules the last reply comes about 1.5 s after its nominal time. The lag grows with slot position, so it spreads replies apart and never pushes them together; it only means a controller should wait a little longer than the nominal window for the last slot.
+- **Later slots land later than nominal (v4 board).** While bytes are on the bus, every v4 module's millisecond clock runs about 15% slow: the software serial port masks interrupts for about 1 ms per byte, longer than the 0.82 ms clock tick, and a tick that falls in the same window as another is lost. A module therefore answers later than `lead-in + (id − lo) × slot` by roughly 15% of the reply traffic before its slot; in a 16-ID `m*A` batch of fully calibrated modules the last reply comes about 1.5 s after its nominal time. The lag grows with slot position, so it spreads replies apart and never pushes them together; it only means a controller should wait a little longer than the nominal window for the last slot. A v5 board's hardware USART does not mask interrupts, so its slots should land on time (not yet measured).
 
 ---
 
@@ -960,7 +979,7 @@ Follow these steps when setting up a module for the first time or after a mechan
 
 9. **Confirm firmware version and check hardware health:**
    ```
-   m38v\n            → m38v:33:38:A3F24C0018E7D29B3F01\n
+   m38v\n            → m38v:36:38:A3F24C0018E7D29B3F01:4\n
    m38T\n            → Hall sensor self-test (expect code 0)
    m38M\n            → mechanical self-test (expect code 0, near-zero spread)
    m38Q\n            → diagnostics snapshot (check supply voltage, reset cause)
@@ -1004,6 +1023,8 @@ With PlatformIO: run `pio run -t fuses` **once per chip** (the equivalent of the
 | v8 or v9 | `0x5E` | Fields loaded, magic rewritten to `0x5D` |
 | Blank chip | `0xFF` | Full default init, ID set to 255 |
 
+> **Upgrading to v36:** v4 modules just update, over the bus or UPDI, with the `-v4` files: same fuses, same EEPROM layout, and every reply unchanged except `v`, which gains the board at the end. **Pick the image for each module's board**: a release now has one per board ([Driver boards](#driver-boards-v36)). The web flasher picks by itself; over the bus, a wall with both boards takes one update per image, and the gateway (4.3.0 and later) leaves the other board's modules alone.
+
 > **Upgrading to v35:** one last flash over UPDI per module installs the bootloader, and with it the fuse `BOOTEND = 0x04` that reserves its 1 KB. The [web flasher](https://avandeputte.github.io/SplitFlapUniversalFirmware/) sets the fuse by itself. With PlatformIO, run `pio run -t fuses` once more; with avrdude, see [FLASHING.md](FLASHING.md). Every later update can then go [over the bus](#updates-over-the-bus-v35). Same EEPROM layout, and every reply is unchanged except `Q`, which gains the bootloader version at the end and now reports the real reset cause. Going back to v35 or older over UPDI needs `BOOTEND = 0x00` again; the web flasher does that by itself too.
 
 > **Upgrading to v34:** just upload; no fuse change, same EEPROM layout, every reply unchanged. It fixes the watchdog, which ran at 0.5 s instead of 2 s. A module therefore restarted part way through any reply longer than about 490 bytes, which means the `A` and `d` dumps of a well-calibrated module never arrived. See [RELEASE_NOTES.md](RELEASE_NOTES.md).
@@ -1018,4 +1039,4 @@ With PlatformIO: run `pio run -t fuses` **once per chip** (the equivalent of the
 
 ### Updates over the bus (v35+)
 
-A module with v35 or later carries a bootloader, so its firmware can be replaced over the RS-485 bus. The gateway sends `m*U` to put every module into update mode, broadcasts the new image page by page, checks each module, and starts the new firmware: a whole wall in under a minute, with nothing unplugged. An update that stops part way leaves a module waiting in update mode for the image, never running half of it, and the module's EEPROM is never touched. [BUS-UPDATE.md](BUS-UPDATE.md) has the protocol and the procedure; [`tools/busflash.py`](tools/busflash.py) does the same from a computer with a USB–RS485 adapter.
+A module with v35 or later carries a bootloader, so its firmware can be replaced over the RS-485 bus, with the release's `firmware-update-v4.bin` or `firmware-update-v5.bin` for its board. The gateway sends `m*U` to put every module into update mode, broadcasts the new image page by page, checks each module, and starts the new firmware: a whole wall in under a minute, with nothing unplugged. An update that stops part way leaves a module waiting in update mode for the image, never running half of it, and the module's EEPROM is never touched. [BUS-UPDATE.md](BUS-UPDATE.md) has the protocol and the procedure; [`tools/busflash.py`](tools/busflash.py) does the same from a computer with a USB–RS485 adapter.

@@ -7,6 +7,9 @@ A browser page that flashes a module through the [SerialUPDI flasher](../FLASHER
 For each module it does what the avrdude instructions in FLASHING.md do, plus a backup, in this order:
 
 1. Identify the chip: it must be an ATtiny1616, and unlocked.
+   - Since v36 it also reads the module's driver board, from the PC0 strap the firmware reads at start-up: PC0 is grounded on the v5 board and unconnected on v4 and earlier ones. Then it picks the image for that board.
+   - The page carries one image per board. Each image names its board at `0x3FFC`, and one built before v36 counts as a v4 image.
+   - A module whose board has no image loaded is refused before the backup and before anything is written to it, fuses included. That happens with a single file you chose for the other board, or a v35 or older image on a v5 board.
 2. Read the EEPROM, which holds the module's ID and calibration, and offer it as a backup file. That file can be written back with avrdude: `-U eeprom:w:FILE:i`.
 3. Compare the fuses with the fixed set from FLASHING.md, and write only the ones that differ. The set depends on the image in one place: `BOOTEND` is `0x04` for an image with the bootloader (v35 and later, recognised by its signature at `0x3FC`) and `0x00` for an older one, so the flasher upgrades and downgrades alike. After each write it reads every fuse back, and stops before touching the flash if the result isn't exactly what was expected. SYSCFG0 is written last, and the code refuses any value that would stop the UPDI pin working or clear EESAVE.
 4. Write the firmware page by page, erasing each page as it goes, then read the whole flash back to verify it. avrdude starts with a chip erase instead, which takes the EEPROM with it unless EESAVE is in effect. A page erase never touches the EEPROM, so the settings are safe even on a chip whose new EESAVE fuse hasn't taken effect yet.
@@ -22,12 +25,12 @@ New fuses take effect only at the restart in step 6. A reset any earlier would e
 | `updi.js` | The programming core: the UPDI protocol (as Microchip's pymcuprog and avrdude's `serialupdi` implement it), Intel HEX parsing, and the routine above. It has no browser dependencies, so it also runs under Node. |
 | `webserial.js` | The serial port, through the Web Serial API. |
 | `index.html`, `app.js` | The page. |
-| `build.mjs` | Builds the published page: `node flasher/build.mjs <firmware.hex> <version>` writes `flasher/dist/index.html`, a single file with the scripts and the firmware inlined. It uses plain Node, with no packages. |
+| `build.mjs` | Builds the published page: `node flasher/build.mjs <version> <firmware.hex>...` writes `flasher/dist/index.html`, a single file with the scripts and the firmware inlined, one image per board. It uses plain Node, with no packages. |
 
 ## Publishing
 
 `.github/workflows/flasher.yml` runs on every published release. It:
-- downloads the release's `firmware.hex`;
+- downloads the release's firmware: `firmware-v4.hex` and `firmware-v5.hex` since v36, `firmware.hex` before;
 - builds the page;
 - attaches it to the release as `flasher.html`;
 - deploys it to GitHub Pages.
@@ -39,7 +42,8 @@ GitHub Pages has to be enabled once, under Settings → Pages → Source: "GitHu
 Build the page and open it straight from disk in Chrome or Edge:
 
 ```
-node flasher/build.mjs .pio/build/ATtiny1616/firmware.hex 33
+pio run -e v4 -e v5
+node flasher/build.mjs 36 .pio/build/v4/firmware.hex .pio/build/v5/firmware.hex
 open flasher/dist/index.html
 ```
 

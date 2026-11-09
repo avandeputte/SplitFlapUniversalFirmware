@@ -2,10 +2,14 @@
 #
 # The firmware is linked to start at 0x0400.  This turns the linker's
 # firmware.hex into the image the chip needs, in place:
-#   0x0000-0x03FF  the bootloader, from bootloader/bootloader.hex
+#   0x0000-0x03FF  the bootloader for the image's board: bootloader/bootloader.hex
+#                  on v4, bootloader/bootloader-v5.hex on v5
 #   0x0400-...     the firmware
+#   0x3FFC         the board the image is for, 4 or 5 (custom_board in
+#                  platformio.ini; since v36).  0x3FFD is reserved (0xFF).
 #   0x3FFE-0x3FFF  CRC-16/CCITT-FALSE of 0x0400..0x3FFD, big-endian: the
-#                  bootloader starts the firmware only if this checks out
+#                  bootloader starts the firmware only if this checks out.  It
+#                  covers the board tag, so a tag cannot be changed in transit.
 # so that `pio run -t upload`, avrdude and the web flasher all write the
 # whole thing.  It also writes firmware-update.bin next to it: 0x0400..0x3FFF,
 # the part the gateway sends over the bus (BUS-UPDATE.md).
@@ -16,7 +20,12 @@ Import("env")  # noqa: F821 (provided by PlatformIO)
 FLASH_SIZE = 0x4000
 APP_START = 0x0400
 CRC_AT = FLASH_SIZE - 2
-BOOTLOADER_HEX = os.path.join(env.subst("$PROJECT_DIR"), "bootloader", "bootloader.hex")  # noqa: F821
+TAG_AT = FLASH_SIZE - 4
+BOARD = int(env.GetProjectOption("custom_board", "4"))  # noqa: F821
+if BOARD not in (4, 5):
+    raise SystemExit(f"custom_board must be 4 or 5, not {BOARD}")
+BOOTLOADER_HEX = os.path.join(env.subst("$PROJECT_DIR"), "bootloader",  # noqa: F821
+                              "bootloader.hex" if BOARD == 4 else f"bootloader-v{BOARD}.hex")
 
 
 def read_hex(path):
@@ -70,30 +79,29 @@ def merge(source, target, env):
     bootloader = read_hex(BOOTLOADER_HEX)
     if not firmware or min(firmware) < APP_START:
         raise SystemExit(f"{hex_path}: the firmware must start at {APP_START:#06x} (link with .text there)")
-    if max(firmware) >= CRC_AT:
-        raise SystemExit(f"{hex_path}: the firmware runs into the image CRC at {CRC_AT:#06x}")
+    if max(firmware) >= TAG_AT:
+        raise SystemExit(f"{hex_path}: the firmware runs into the board tag at {TAG_AT:#06x}")
     if max(bootloader) >= APP_START:
         raise SystemExit(f"{BOOTLOADER_HEX}: the bootloader runs past {APP_START:#06x}")
 
     image = bytearray(b"\xff" * FLASH_SIZE)
     for a, b in list(bootloader.items()) + list(firmware.items()):
         image[a] = b
+    image[TAG_AT] = BOARD
     crc = crc16(image[APP_START:CRC_AT])
-    if crc == 0xFFFF:                       # means "no image" to the bootloader
-        if CRC_AT - 1 in firmware:
-            raise SystemExit("the image CRC is 0xFFFF and there is no spare byte to change it")
-        image[CRC_AT - 1] = 0xFE
+    if crc == 0xFFFF:                       # means "no image" to the bootloader:
+        image[TAG_AT + 1] = 0xFE            # change the reserved byte instead
         crc = crc16(image[APP_START:CRC_AT])
     image[CRC_AT], image[CRC_AT + 1] = crc >> 8, crc & 0xFF
 
     end = max(firmware) + 1
-    write_hex(hex_path, image, [(0, end), (CRC_AT - 1 if image[CRC_AT - 1] != 0xFF else CRC_AT, FLASH_SIZE)])
+    write_hex(hex_path, image, [(0, end), (TAG_AT, FLASH_SIZE)])
     with open(os.path.join(os.path.dirname(hex_path), "firmware-update.bin"), "wb") as f:
         f.write(image[APP_START:])
     sig = bytes(image[APP_START - 4:APP_START])
     version = sig[3] if sig[:3] == b"SFB" else "?"
-    print(f"Image: bootloader v{version} ({len(bootloader)} bytes), firmware {end - APP_START} bytes "
-          f"(of {CRC_AT - APP_START}), CRC {crc:04X}; firmware-update.bin for the bus")
+    print(f"Image: board v{BOARD}, bootloader v{version} ({len(bootloader)} bytes), firmware "
+          f"{end - APP_START} bytes (of {TAG_AT - APP_START}), CRC {crc:04X}; firmware-update.bin for the bus")
 
 
 env.Depends("$BUILD_DIR/${PROGNAME}.hex", BOOTLOADER_HEX)  # noqa: F821

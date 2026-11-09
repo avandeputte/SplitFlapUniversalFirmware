@@ -7,7 +7,7 @@ Open the **[web flasher](https://avandeputte.github.io/SplitFlapUniversalFirmwar
 1. It checks the chip.
 2. It saves a backup of the module's settings to a file.
 3. It writes the fuses, if the chip needs them.
-4. It flashes the current release and verifies it.
+4. It reads which driver board the module is, then flashes the current release's image for that board and verifies it.
 5. It checks the module kept its ID and calibration.
 
 Then attach the next module and click **Flash next module**.
@@ -16,12 +16,12 @@ To use it offline, download `flasher.html` from the Assets of the [latest releas
 
 ## With avrdude
 
-You do not need VSCode, PlatformIO or a compiler to put the current firmware on a module. Every [release](https://github.com/avandeputte/SplitFlapUniversalFirmware/releases/latest) includes the compiled `firmware.hex`, and the free command-line tool **avrdude** writes it to the chip through the [SerialUPDI flasher](FLASHER.md). Two commands per module: one writes the fuses, one writes the firmware.
+You do not need VSCode, PlatformIO or a compiler to put the current firmware on a module. Every [release](https://github.com/avandeputte/SplitFlapUniversalFirmware/releases/latest) includes the compiled firmware, one `.hex` file per driver board, and the free command-line tool **avrdude** writes it to the chip through the [SerialUPDI flasher](FLASHER.md). Two commands per module: one writes the fuses, one writes the firmware.
 
 ## What you need
 
 - The flasher and its three jumper wires, from [FLASHER.md](FLASHER.md).
-- `firmware.hex` from the **Assets** section of the [latest release](https://github.com/avandeputte/SplitFlapUniversalFirmware/releases/latest). Save it somewhere easy to reach, such as your Downloads folder.
+- The firmware for your module's board, from the **Assets** section of the [latest release](https://github.com/avandeputte/SplitFlapUniversalFirmware/releases/latest) (see below). Save it somewhere easy to reach, such as your Downloads folder.
 - **avrdude 7.0 or newer.** The `serialupdi` programmer was added in 7.0; older versions do not know it.
 
 | System | Install |
@@ -31,6 +31,23 @@ You do not need VSCode, PlatformIO or a compiler to put the current firmware on 
 | Linux | `sudo apt install avrdude` on Debian or Ubuntu 24.04 and newer. Older distributions ship avrdude 6.x, which lacks `serialupdi`; use the release build from the page above instead. Give yourself access to the port with `sudo usermod -aG dialout $USER`, then log out and back in. |
 
 Check the install: `avrdude -c '?'` lists the supported programmers, and `serialupdi` should be among them.
+
+## Which file: the driver board
+
+Since v36 every release has one image per driver board ([README](README.md#driver-boards-v36)):
+
+| Board | File |
+|---|---|
+| v4, and earlier boards | `firmware-v4.hex` |
+| v5 | `firmware-v5.hex` |
+
+Releases up to v35 have a single `firmware.hex`, which is for the v4.
+
+A module running v36 or later reports its board as the last field of its `m<ID>v` reply, and the gateway's Modules tab shows it. The web flasher reads it from the board itself and needs no choice. avrdude can't tell: it writes whatever it is given.
+
+**A wrong image leaves the module doing nothing.** It also writes the other board's bootloader, which can't reach the transceiver, so the module can't be updated over the bus either. Flash the right image over UPDI to fix it; the settings are kept.
+- **On a v5 board, the v4 image is the one to avoid.** Its bootloader drives PA5 and PA6, two pins of the v5's IO header, while it waits.
+- **On a v4 board, the v5 image** drives nothing.
 
 ## Find the port
 
@@ -92,10 +109,10 @@ These are the same values `platformio.ini` writes with `pio run -t fuses`. If a 
 ## Step 2: write the firmware
 
 ```
-avrdude -c serialupdi -p attiny1616 -P PORT -b 57600 -U flash:w:firmware.hex:i
+avrdude -c serialupdi -p attiny1616 -P PORT -b 57600 -U flash:w:firmware-v4.hex:i
 ```
 
-Run it from the folder where you saved `firmware.hex`, or give the full path to the file. From v35 the file holds the bootloader as well as the firmware, and this writes both. It takes about 25 seconds and ends with a line like `16244 bytes of flash verified` (the exact number depends on the release). The module restarts on the new firmware immediately.
+On a v5 board, write `firmware-v5.hex` instead. Run it from the folder where you saved the file, or give the full path to it. From v35 the file holds the bootloader as well as the firmware, and this writes both. It takes about 25 seconds and ends with a line like `16244 bytes of flash verified` (the exact number depends on the release). The module restarts on the new firmware immediately.
 
 ## Step 3, optional: confirm the settings survived
 

@@ -1,8 +1,47 @@
 # Release Notes
 
-Version history for the Split-Flap Universal Firmware. The firmware version is reported by the `v` and `A` commands (e.g. `m38v` → `m38v:35:38:<serial>`).
+Version history for the Split-Flap Universal Firmware. The firmware version is reported by the `v` and `A` commands (e.g. `m38v` → `m38v:36:38:<serial>:4`).
 
 All versions from v6 onward share the same EEPROM field layout, and every change to a reply has been **append-only** — new fields are added at the end so older controllers keep working. Upgrading preserves a module's ID and calibration **as long as the `EESAVE` fuse is set** (see [SETUP.md](SETUP.md) § "Write the fuses").
+
+---
+
+## v36 — Two driver boards
+
+v36 supports a second module board, the **v5**, whose RS-485 transceiver is on the ATtiny1616's hardware USART instead of bit-banged pins. Each board needs its own firmware, so **from v36 every release has one set of files per board**. On a v4 module nothing else changes: same EEPROM, same timing, and every reply is the same except `v`, which gains one field at the end.
+
+**Which file**
+
+| Board | Flash over UPDI | Update over the bus |
+|---|---|---|
+| v4, and earlier boards | `firmware-v4.hex` | `firmware-update-v4.bin` |
+| v5 | `firmware-v5.hex` | `firmware-update-v5.bin` |
+
+- **The [web flasher](https://avandeputte.github.io/SplitFlapUniversalFirmware/) picks the image by itself.** It carries both, reads which board each module is, and writes that board's image. A file you choose yourself is for one board, and a module on the other board is refused before anything is written to it.
+- **The gateway** (4.3.0 and later) reads the board from the image you upload and updates only the modules on that board, so a wall with both boards takes one run per image.
+- **A wrong image sent over the bus does no harm.** Before anything else, the firmware reads the board from a strap on the module's PC0 pin. On the wrong board it goes straight back into its bootloader without touching a bus pin, and waits there for the right image.
+- **Over UPDI, a wrong image also brings the other board's bootloader**, and the module can then be fixed only over UPDI. The web flasher refuses to write one. With avrdude, see [FLASHING.md](FLASHING.md).
+- **v4 modules need no UPDI flash.** Their v35 bootloader is unchanged, so `firmware-update-v4.bin` updates them over the bus.
+
+**Replies**
+- **`v` appends `:<board>`**, `4` or `5`: `m38v:36:38:<serial>:4`. Older controllers ignore it, and a module without the field is a v4.
+- **The v5 bootloader is version 2.** It reports 2 in `Q`'s last field, and its status frame in update mode has one more byte, the board ([BUS-UPDATE.md](BUS-UPDATE.md)). The v4 bootloader is still version 1, byte for byte the one in v35.
+
+**The v5 board**
+- **The bus is on USART0's alternate pins:** PA1 (TX), PA2 (RX) and PA4 (driver enable), which the USART switches by itself in its RS-485 mode. Received bytes go through an interrupt into a 128-byte buffer, as on v4, and the reply timing is the same.
+- **The baud rate is corrected** for each chip's factory-measured oscillator error.
+- **The v5 bootloader** uses the USART too, and will not run on any board but a v5.
+
+**Build**
+- **`pio run` builds the v4 board, `pio run -e v5` the v5**, and `pio run -e v4 -e v5` both. Each upload writes only its own board's image.
+- **Each image names its board** at `0x3FFC`, inside the range the image CRC covers. The firmware may now use 15,356 bytes, down from 15,358. It uses 14,749 on v4 and 13,675 on v5, where SoftwareSerial is gone.
+- **The bootloader's host tests** run on both builds: 5,588 checks on v4 and 5,589 on v5.
+
+**Tried on hardware**
+- **v5:** four modules flashed over UPDI. On each, the bootloader starts the firmware, which reads the strap as v5 and sets up the USART on the right pins, and the module announces itself on the bus every 10–15 s. Receiving commands, and an update over the bus, are not yet tried on a v5.
+- **v4:** a module on older firmware without the bootloader was flashed with the web flasher's routine. It wrote the four fuses, kept the settings, and v36 starts: it stays in its firmware, with the motor and its own bus pins set up, and announces itself on the bus. Given only the v5 image, the routine refused and left the module unchanged. An update over the bus from v35 is not yet tried with v36.
+- **Web flasher:** its routine, run from Node against a v5 module, read the board from PC0 and wrote and verified the v5 image in 24 s, with the settings kept. Given only the v4 image, it refused before the backup, and the chip's flash, fuses and EEPROM were unchanged. The page itself is not yet tried in a browser.
+- **A v5 module sent the v4 firmware**, as an update over the bus would leave it: it starts the firmware, goes back to its bootloader, and waits there for the right image, restarting every 8 s. PA5 and PA6 were never outputs.
 
 ---
 

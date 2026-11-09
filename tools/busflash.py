@@ -1,18 +1,24 @@
 #!/usr/bin/env python3
 """Update split-flap modules' firmware over the RS-485 bus (BUS-UPDATE.md).
 
-    python3 tools/busflash.py PORT firmware-update.bin --id 27
-    python3 tools/busflash.py PORT firmware-update.bin --id 3 --id 4 --id 5
-    python3 tools/busflash.py PORT firmware-update.bin --all --id 3 --id 4
+    python3 tools/busflash.py PORT firmware-update-v4.bin --id 27
+    python3 tools/busflash.py PORT firmware-update-v4.bin --id 3 --id 4 --id 5
+    python3 tools/busflash.py PORT firmware-update-v5.bin --all --id 3 --id 4
 
 PORT is a USB-RS485 adapter on the modules' bus (with nothing else talking;
-unplug the gateway).  firmware-update.bin comes with every release from v35.
-The modules must already run v35 or later, which installed the bootloader.
+unplug the gateway).  Every release from v36 has one image per driver board,
+firmware-update-v4.bin and firmware-update-v5.bin (v35's firmware-update.bin
+is a v4 image).  The modules must already run v35 or later, which installed
+the bootloader.
 
 --id N   a module to update; give it once per module.  The modules are asked
          for their status one by one, so every module must be named.
---all    send the pages to every module at once (address 0xFF) instead of to
-         each in turn: a whole wall in about 45 s instead of 45 s a module.
+--all    send the pages to every named module at once (address 0xFF) instead
+         of to each in turn: a whole wall in about 45 s instead of 45 s a module.
+
+Only the named modules go into update mode, so only they take the pages.  If
+any of them is on another board than the image's, nothing is sent: they are
+all returned to their firmware.  A wall with both boards takes two runs.
 
 This is the reference for a gateway's implementation: it does what
 BUS-UPDATE.md describes, step by step, with the timing it gives.
@@ -31,6 +37,7 @@ except ImportError:
 PAGE = 64
 FIRST_PAGE, LAST_PAGE = 16, 255           # the firmware: 0x0400..0x3FFF
 IMAGE_SIZE = (LAST_PAGE + 1 - FIRST_PAGE) * PAGE
+BOARD_AT = IMAGE_SIZE - 4                 # flash 0x3FFC: the board the image is for (v36+)
 TO_ALL = 0xFF
 BYTE_TIME = 10 / 9600                     # 8N1 at 9600 baud
 # Quiet time after the last byte of a frame (BUS-UPDATE.md, "Timing"):
@@ -97,10 +104,20 @@ def status(bus, mid, tries=3):
                 d = bytes.fromhex(line[1:].decode())
             except ValueError:
                 continue
-            if len(d) == 41 and crc16(d) == 0 and d[0] == mid and d[1] == ord('s'):
+            # 41 bytes from bootloader version 1 (v4 board); version 2 (v5)
+            # adds the board before the CRC.
+            if len(d) in (41, 42) and crc16(d) == 0 and d[0] == mid and d[1] == ord('s'):
                 return {'version': d[2], 'reason': d[3], 'flags': d[4],
-                        'image': int.from_bytes(d[5:7], 'big'), 'pages': d[7:39]}
+                        'image': int.from_bytes(d[5:7], 'big'), 'pages': d[7:39],
+                        'board': d[39] if len(d) == 42 else 4}
     return None
+
+
+def image_board(image):
+    """The board an image is for.  Images before v36 have no tag (0xFF) and are
+    all v4 images."""
+    b = image[BOARD_AT]
+    return b if 1 <= b <= 9 else 4
 
 
 def missing(st, image_crc):
@@ -122,29 +139,44 @@ def send_pages(bus, to, image, image_crc, pages):
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split('\n\n')[0])
     ap.add_argument('port')
-    ap.add_argument('image', help='firmware-update.bin from a release')
+    ap.add_argument('image', help='firmware-update-v4.bin or -v5.bin from a release')
     ap.add_argument('--id', type=int, action='append', required=True, help='a module to update')
     ap.add_argument('--all', action='store_true', help='send the pages to all modules at once')
     args = ap.parse_args()
 
     image = open(args.image, 'rb').read()
     if len(image) != IMAGE_SIZE:
-        sys.exit(f'{args.image}: {len(image)} bytes, expected {IMAGE_SIZE} (firmware-update.bin)')
+        sys.exit(f'{args.image}: {len(image)} bytes, expected {IMAGE_SIZE} (firmware-update-v4.bin or -v5.bin)')
     image_crc = int.from_bytes(image[-2:], 'big')
     if crc16(image[:-2]) != image_crc or image_crc == 0xFFFF:
         sys.exit(f'{args.image}: its CRC does not check out')
+    board = image_board(image)
+    print(f'{args.image}: an image for board v{board}')
     bus = Bus(args.port)
     ids = args.id
 
+    # One by one, not m*U: modules left in their firmware ignore the pages, so a
+    # module on the other board can never take this image, even with --all.
     print('Into the bootloader:', ', '.join(map(str, ids)))
-    for mid in ([TO_ALL] if args.all else ids):
-        bus.firmware_frame('m*U' if mid == TO_ALL else f'm{mid}U')
+    for mid in ids:
+        bus.firmware_frame(f'm{mid}U')
         bus.idle(ENTER_WAIT)
+    wrong = []
     for mid in ids:
         st = status(bus, mid)
         if not st:
             sys.exit(f'module {mid} does not answer in its bootloader: is it running v35 or later?')
-        print(f'  module {mid}: bootloader {st["version"]}')
+        print(f'  module {mid}: bootloader {st["version"]}, board v{st["board"]}')
+        if st['board'] != board:
+            wrong.append((mid, st['board']))
+    if wrong:
+        # G before any P returns a module to the firmware it already has.
+        for mid in ids:
+            bus.frame([mid, ord('G')])
+            bus.idle(GO_WAIT)
+        sys.exit('this image is for board v%d, and %s: nothing was sent, and every module is back on '
+                 'its firmware.  Update each board with its own image.' %
+                 (board, ', '.join(f'module {m} is a v{b}' for m, b in wrong)))
 
     todo = {mid: list(range(FIRST_PAGE, LAST_PAGE + 1)) for mid in ids}
     for attempt in range(1, 6):

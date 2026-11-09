@@ -1,5 +1,5 @@
 // ==============================================================================
-// Split-Flap Universal Firmware — v32
+// Split-Flap Universal Firmware — v36
 // ==============================================================================
 // Each module controls one character cell driven by a 28BYJ-48 stepper motor.
 // A Hall effect sensor detects a magnet on the reel to find the home position.
@@ -166,7 +166,10 @@
 //              m*A50-99\n   → only IDs 50–99 answer
 //  e         Erase calibrated flap position map
 //  R         Reset provisioning (erase ID, resume advertising)  [v9+]
-//  v         Report firmware version and serial number  → replies m<id>v:<version>:<moduleId>:<serialNumber>\n
+//  v         Report firmware version, serial number and board
+//              → replies m<id>v:<version>:<moduleId>:<serialNumber>:<board>\n
+//            <board> (appended in v36) is the driver board the image is built
+//            for and running on: 4 or 5 (see "Pin assignments").
 //            Broadcast form may carry an optional ID range to poll the bus in
 //            batches (recommended for large installations):
 //              m*v\n        → all provisioned modules answer (slot = id × 100 ms)
@@ -178,11 +181,13 @@
 //            Slot timing (m*v and m*A): the clock starts when the module parses
 //            the broadcast's terminator ('\n'/'\r', or 50 ms of silence if there
 //            is none); the reply goes out at REPLY_LEADIN_MS + (id-lo) × slot,
-//            once the bus has been quiet for CSMA_LISTEN_MS (v33).  millis()
-//            loses ~15% while bytes are on the bus (SoftwareSerial masks
-//            interrupts for ~1 ms per byte), so later slots land later than
+//            once the bus has been quiet for CSMA_LISTEN_MS (v33).  On a v4
+//            board millis() loses ~15% while bytes are on the bus (SoftwareSerial
+//            masks interrupts for ~1 ms per byte), so later slots land later than
 //            nominal by ~15% of the reply traffic before them.  The lag only
 //            grows with slot index, so it spreads replies apart, never together.
+//            A v5 board's hardware USART does not mask interrupts, so its slots
+//            land on time; the slot spacing is the same on both boards.
 //  F         Factory-reset EEPROM defaults (preserves module ID and magic byte)
 //  U         Restart into the bootloader to take a firmware update over the
 //            bus (v35; BUS-UPDATE.md).  Only in a checksummed frame (see
@@ -428,7 +433,14 @@
 // ==============================================================================
 
 #include <Arduino.h>
+#ifndef SF_BOARD
+#define SF_BOARD 4                 // platformio.ini sets it: -DSF_BOARD=4 or 5
+#endif
+#if SF_BOARD == 4
 #include <SoftwareSerial.h>
+#elif SF_BOARD != 5
+#error "SF_BOARD must be 4 or 5"
+#endif
 #include <EEPROM.h>
 #include <avr/wdt.h>
 #include <avr/pgmspace.h>
@@ -508,13 +520,25 @@ void gotoRawStep(long target);
 
 // ── Firmware version ──────────────────────────────────────────────────────────
 // Returned by the 'v', 'A', and mXA commands.  Bump when you change behaviour.
-const char FIRMWARE_VERSION[] = "35";
+const char FIRMWARE_VERSION[] = "36";
 
 // ── Pin assignments ───────────────────────────────────────────────────────────
-// RS-485 transceiver
-const int RS485_RX = 3;     // microcontroller RX  (from transceiver RO)
-const int RS485_TX = 1;     // microcontroller TX  (to   transceiver DI)
-const int RS485_DE = 2;     // driver enable       (HIGH = transmit)
+// Two driver boards, one build each (SF_BOARD, from platformio.ini).  They differ
+// only in where the RS-485 transceiver is wired:
+//   v4  (Adam's board)  PA5 TX, PA7 RX, PA6 DE.  Not USART pins, so the bus is
+//                       SoftwareSerial.
+//   v5                  PA1 TX, PA2 RX, PA4 DE: USART0's alternate pins, so the
+//                       bus is the hardware USART, which drives DE itself.
+// v5 grounds PC0; v4 leaves it unconnected.  checkBoard() reads it before
+// anything else runs, and an image on the wrong board never touches the bus pins
+// (see boardFromStrap()).  On
+// either board the OTHER board's bus pins go to the IO header: never drive them,
+// and never make PC0 an output (on v5 it is a short to ground).
+#if SF_BOARD == 4
+const int RS485_RX = 3;     // PA7  microcontroller RX  (from transceiver RO)
+const int RS485_TX = 1;     // PA5  microcontroller TX  (to   transceiver DI)
+const int RS485_DE = 2;     // PA6  driver enable       (HIGH = transmit)
+#endif
 // Stepper coils (via ULN2003 or similar)
 #define IN1 9
 #define IN2 8
@@ -825,7 +849,96 @@ uint8_t hallActiveLevel = HALL_DEFAULT_ACTIVE;
 // ==========================================
 //               GLOBALS
 // ==========================================
+#if SF_BOARD == 4
 SoftwareSerial rs485(RS485_RX, RS485_TX);
+#else
+// ── v5: the bus on USART0 ─────────────────────────────────────────────────────
+// The same calls as the SoftwareSerial it replaces, with the same semantics, so
+// the rest of the firmware is identical on both boards: a 128-byte receive ring
+// (127 usable) filled by the receive interrupt; a byte that finds it full is
+// dropped and sets the overflow flag, which overflow() reports and clears.  The
+// difference is that receiving takes a few microseconds of interrupt per byte
+// instead of masking interrupts for the whole byte.  In RS-485 mode the USART
+// raises DE (XDIR, PA4) a bit before each start bit and drops it a bit after the
+// last stop bit; with /RE tied to DE the receiver is off meanwhile, as on v4.
+static uint8_t          busRing[128];
+static volatile uint8_t busHead, busTail;    // ISR writes busHead, the firmware busTail
+static volatile bool    busOverflow;
+
+ISR(USART0_RXC_vect) {
+  uint8_t err = USART0.RXDATAH;             // read before RXDATAL
+  uint8_t c = USART0.RXDATAL;
+  uint8_t next = (busHead + 1) & 127;
+  if (err & USART_BUFOVF_bm) busOverflow = true;   // the USART itself lost a byte
+  if (next == busTail) { busOverflow = true; return; }
+  busRing[busHead] = c;
+  busHead = next;
+}
+
+class UsartBus {
+public:
+  void begin(uint32_t baud) {
+    PORTMUX.CTRLB |= PORTMUX_USART0_ALTERNATE_gc;   // PA1-PA4; the default pins are the motor
+    VPORTA.OUT |= PIN1_bm;                          // TX idles high, before it becomes an output
+    VPORTA.DIR |= PIN1_bm | PIN4_bm;                // TX, and DE (low: listening; R3 holds it there)
+    uint16_t b = (uint16_t)((4UL * F_CPU + baud / 2) / baud);   // 64 x f / (16 x baud)
+    b += (int32_t)b * (int8_t)SIGROW.OSC20ERR3V / 1024;          // factory oscillator error at 3 V
+    USART0.BAUD = b;
+    USART0.CTRLC = USART_CHSIZE_8BIT_gc;            // async 8N1
+    USART0.CTRLA = USART_RXCIE_bm | USART_RS485_EXT_gc;
+    USART0.CTRLB = USART_RXEN_bm | USART_TXEN_bm;
+  }
+  int available() { return (uint8_t)(busHead - busTail) & 127; }
+  int read() {
+    if (busHead == busTail) return -1;
+    uint8_t c = busRing[busTail];
+    busTail = (busTail + 1) & 127;
+    return c;
+  }
+  bool overflow() { bool o = busOverflow; if (o) busOverflow = false; return o; }
+  size_t write(uint8_t c) {
+    while (!(USART0.STATUS & USART_DREIF_bm)) {}
+    USART0.STATUS = USART_TXCIF_bm;                 // so finish() waits for THIS byte
+    USART0.TXDATAL = c;
+    sending = true;
+    return 1;
+  }
+  size_t write(const uint8_t *p, size_t n) { for (size_t i = 0; i < n; i++) write(p[i]); return n; }
+  size_t print(const char *str) { size_t n = 0; while (*str) n += write((uint8_t)*str++); return n; }
+  // Wait until the last stop bit is on the wire (write() returns once a byte is
+  // queued), so txEnd() times its hold from the same moment as on v4.
+  void finish() { if (sending) while (!(USART0.STATUS & USART_TXCIF_bm)) {} sending = false; }
+private:
+  bool sending = false;
+};
+UsartBus rs485;
+#endif
+
+// The board this module is, from the PC0 strap: grounded on v5, not connected on
+// v4.  PC0 stays an input (its reset state) with the pull-up on; read twice, and
+// anything but two clear lows counts as v4, the board on which a wrong guess
+// cannot hurt.
+uint8_t boardFromStrap() {
+  PORTC.PIN0CTRL = PORT_PULLUPEN_bm;
+  delayMicroseconds(20);
+  uint8_t a = VPORTC.IN & PIN0_bm;
+  delayMicroseconds(5);
+  uint8_t b = VPORTC.IN & PIN0_bm;
+  return (a == 0 && b == 0) ? 5 : 4;
+}
+
+// An image runs only on the board it was built for.  On the wrong one it leaves
+// every bus pin alone (they are the IO header there) and waits in the bootloader
+// for the right image: the bootloader restarts it after 8 s, it asks again, and
+// the module spends nearly all its time where the gateway can reach it.  A
+// nuisance, never a brick.
+// This runs from .init5, before main() and before the C++ constructors (.init6),
+// not from setup(): the v4 image's SoftwareSerial constructor makes PA5 an
+// output, and on a v5 board PA5 is the IO header.  RAM is set up by then (.init4)
+// and r1 is zero (.init2).  naked: no return, it falls through into .init6.
+static void __attribute__((naked, used, section(".init5"))) checkBoard() {
+  if (boardFromStrap() != SF_BOARD) enterBootloader();
+}
 
 long currentStepPos   = 0;
 int  currentPhase     = 0;
@@ -1021,7 +1134,7 @@ char   provCmd     = 0;
 
 // Bus counters since boot, reported at the end of the 'Q' snapshot (RAM only;
 // they wrap at 65535, so a controller should compare successive readings).
-//   rxOverflows  times SoftwareSerial's ring overflowed (bytes were dropped
+//   rxOverflows  times the receive ring overflowed (bytes were dropped
 //                while the module was busy) — each one also means a frame was
 //                abandoned by the overflow guard
 //   bcastSent    staggered broadcast replies (m*v / m*A) transmitted
@@ -1183,12 +1296,19 @@ bool busQuiet() {
 // the whole window regardless of what ran before it.
 void txBegin() {
   wdt_reset();
+#if SF_BOARD == 4
   digitalWrite(RS485_DE, HIGH);
-  delayMicroseconds(200);          // driver-enable settle before the start bit
+#endif
+  delayMicroseconds(200);          // driver-enable settle before the start bit (v5: same pacing)
 }
 void txEnd() {
-  delay(2);                        // hold DE until the final stop bit is on the wire
+#if SF_BOARD == 5
+  rs485.finish();                  // the last stop bit is out; the USART has dropped DE
+#endif
+  delay(2);                        // v4: hold DE until the final stop bit is on the wire
+#if SF_BOARD == 4
   digitalWrite(RS485_DE, LOW);
+#endif
   while (rs485.available()) rs485.read();   // discard self-echo
   // If the ring overflowed while the handler now replying was busy (or loop()
   // was still consuming pre-gap bytes), that drain just threw away the head of
@@ -1429,9 +1549,10 @@ void resetProvisioning() {
 // ==========================================
 //         VERSION RESPONSE
 // ==========================================
-// Reply format:  m<id>v:<version>:<moduleId>:<serialNumber>\n
-// Example:       m38v:12:38:A3F24C0018E7D29B3F01\n
-// Unprovisioned: m255v:12:255:A3F24C0018E7D29B3F01\n
+// Reply format:  m<id>v:<version>:<moduleId>:<serialNumber>:<board>\n
+// Example:       m38v:36:38:A3F24C0018E7D29B3F01:4\n
+// Unprovisioned: m255v:36:255:A3F24C0018E7D29B3F01:5\n
+// <board> was appended in v36; older firmware ends at the serial number.
 //
 // Called by loop() after the deferred reply timer fires — never called
 // directly from the parser so there are no blocking delays in the RX path.
@@ -1440,7 +1561,10 @@ void sendVersionResponse() {
   n = appendStr(workBuf, n, FIRMWARE_VERSION);
   workBuf[n++] = ':';
   n = appendNum(workBuf, n, moduleId, ':');
-  sendReply(appendStr(workBuf, n, serialStr));
+  n = appendStr(workBuf, n, serialStr);
+  workBuf[n++] = ':';
+  workBuf[n++] = '0' + SF_BOARD;
+  sendReply(n);
 }
 
 // ==========================================
@@ -2144,8 +2268,10 @@ void setup() {
   pinMode(IN1, OUTPUT); pinMode(IN2, OUTPUT);
   pinMode(IN3, OUTPUT); pinMode(IN4, OUTPUT);
   pinMode(HALL_PIN, INPUT_PULLUP);
+#if SF_BOARD == 4
   pinMode(RS485_DE, OUTPUT);
   digitalWrite(RS485_DE, LOW);
+#endif
 
   readSerialNumber();
   seedRandom();

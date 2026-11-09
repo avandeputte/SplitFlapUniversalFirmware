@@ -17,14 +17,24 @@
 // The reset flags are left alone: the firmware's startup reads and clears
 // them, and reports them.
 //
-// In update mode the bootloader listens on the bus (9600 8N1, bit-banged on
-// the firmware's pins, uart.S) for frames of upper-case hex between '#' and
-// '\n':  <to> <command> <payload...> <CRC-16, big-endian>
+// There is one build per driver board (SF_BOARD, as for the firmware); they
+// differ only in how they reach the transceiver:
+//   v4  bootloader.hex      BL_VERSION 1, the bus bit-banged on PA5/PA7, DE on
+//                           PA6 (uart.S)
+//   v5  bootloader-v5.hex   BL_VERSION 2, the bus on USART0's alternate pins
+//                           (PA1/PA2), DE driven by the USART on PA4.  It checks
+//                           the board's PC0 strap and stays off the bus on any
+//                           other board.  Its status reply ends with the board.
+//
+// In update mode the bootloader listens on the bus (9600 8N1) for frames of
+// upper-case hex between '#' and '\n':  <to> <command> <payload...> <CRC-16,
+// big-endian>
 // The CRC is CRC-16/CCITT-FALSE, as in the firmware's checksummed frames, and
 // <to> is the module ID from EEPROM, or 0xFF for every module.
 //   P <image CRC:2> <page> <64 bytes>   write one flash page of an image
 //   S                                   status, to one module only; reply:
-//         <id> 's' <version> <reason> <flags> <image CRC:2> <pages:32>
+//         <id> 's' <version> <reason> <flags> <image CRC:2> <pages:32> [<board>]
+//       (<board>, 5, only from the v5 build: BL_VERSION 2)
 //   G                                   go: start the image if it checks out,
 //                                       or with no image, the old firmware
 // The first P of an image (a new image CRC) erases the stored image CRC, so a
@@ -37,7 +47,16 @@
 // =============================================================================
 #include <stdint.h>
 
+#ifndef SF_BOARD
+#define SF_BOARD          4                // build.py sets it: 4 or 5
+#endif
+#if SF_BOARD == 4
 #define BL_VERSION        1
+#elif SF_BOARD == 5
+#define BL_VERSION        2
+#else
+#error "SF_BOARD must be 4 or 5"
+#endif
 #define APP_START         0x0400u          // BOOTEND = 0x04
 #define FLASH_SIZE        0x4000u
 #define PAGE_SIZE         64u
@@ -61,10 +80,6 @@
 #else
 #include <avr/io.h>
 
-#define DE_BIT            6                // PA6, driver enable, high = transmit
-#define TX_BIT            5                // PA5, to the transceiver's DI
-#define RX_BIT            7                // PA7, from its RO
-
 // The flash appears in the data space; reads come from the flash and writes
 // go to the NVM controller's page buffer.
 #define FLASH_RD(a)       (*(volatile uint8_t *)(MAPPED_PROGMEM_START + (a)))
@@ -75,6 +90,19 @@
 #define WDR()             __asm__ __volatile__("wdr")
 #define START_APP()       __asm__ __volatile__("jmp %0" :: "i"(APP_START))
 #define SW_RESET()        do { _PROTECTED_WRITE(RSTCTRL.SWRR, RSTCTRL_SWRE_bm); for (;;) {} } while (0)
+// Keep a pointer in Y, so that the fields behind it are reached as Y+offset
+// (2 bytes of code each) rather than by address (4 bytes).
+#define IN_Y(p)           __asm__("" : "+y"(p))
+
+void half_bit(void);                       // uart.S
+
+#if SF_BOARD == 4
+// v4: the bus bit-banged on the transceiver's pins (uart.S).
+#define DE_BIT            6                // PA6, driver enable, high = transmit
+#define TX_BIT            5                // PA5, to the transceiver's DI
+#define RX_BIT            7                // PA7, from its RO
+uint8_t rx(void);                          // uart.S
+void tx(uint8_t b);
 #define DRIVE_BUS(on)     do { if (on) VPORTA.OUT |= 1 << DE_BIT; else VPORTA.OUT &= ~(1 << DE_BIT); } while (0)
 #define SET_UP_UPDATE_MODE() do {                                                  \
     VPORTA.OUT |= 1 << TX_BIT;                         /* idle high */             \
@@ -82,13 +110,43 @@
     PORTA.PIN7CTRL = PORT_PULLUPEN_bm;                 /* RX defined while the receiver is off */ \
     _PROTECTED_WRITE(WDT.CTRLA, WDT_PERIOD_8KCLK_gc);                              \
   } while (0)
-// Keep a pointer in Y, so that the fields behind it are reached as Y+offset
-// (2 bytes of code each) rather than by address (4 bytes).
-#define IN_Y(p)           __asm__("" : "+y"(p))
-
-uint8_t rx(void);                          // uart.S
-void tx(uint8_t b);
-void half_bit(void);
+#else
+// v5: the bus on USART0's alternate pins, PA1 TX and PA2 RX (the default pins
+// are the motor).  In RS-485 mode the USART raises DE (XDIR, PA4) a bit before
+// each start bit and drops it a bit after the last stop bit, so DRIVE_BUS has
+// nothing to do; R3 holds DE low, and R4 holds RX high, from power-up.  Polled:
+// update mode does nothing but listen, and between frames it has time for a
+// page write before the next frame (the gateway's 20 ms gap after each P), so
+// the USART's two-byte buffer is enough.  A byte lost anyway spoils its frame's
+// CRC, and the gateway sends that page again.
+static uint8_t __attribute__((noinline)) rx(void) {
+  while (!(USART0.STATUS & USART_RXCIF_bm)) {}
+  return USART0.RXDATAL;
+}
+static void __attribute__((noinline)) tx(uint8_t b) {
+  while (!(USART0.STATUS & USART_DREIF_bm)) {}
+  USART0.TXDATAL = b;
+}
+#define DRIVE_BUS(on)     ((void)0)
+// The strap first: PC0 is grounded on a v5 board and floats on v4, where PA1,
+// PA2 and PA4 are the IO header.  Not a v5: drive nothing, and let the
+// watchdog restart the chip (only a UPDI flash puts this build on a v4 board).
+// The baud register is 64 x 10 MHz / (16 x 9600) = 4167, corrected for the
+// oscillator's factory-measured error at 3 V (1/1024 per count; 4167/1024 = ~4).
+// CTRLC's reset value is already async 8N1.
+#define SET_UP_UPDATE_MODE() do {                                                  \
+    _PROTECTED_WRITE(WDT.CTRLA, WDT_PERIOD_8KCLK_gc);                              \
+    PORTC.PIN0CTRL = PORT_PULLUPEN_bm;                                             \
+    half_bit();                                                                    \
+    if (VPORTC.IN & PIN0_bm) for (;;) {}                                           \
+    PORTMUX.CTRLB = PORTMUX_USART0_ALTERNATE_gc;                                   \
+    VPORTA.OUT |= PIN1_bm;                             /* TX idles high */         \
+    VPORTA.DIR |= PIN1_bm | PIN4_bm;                   /* TX, and DE for the USART */ \
+    USART0.BAUD = 4167 + 4 * (int8_t)SIGROW.OSC20ERR3V;                            \
+    USART0.CTRLA = USART_RS485_EXT_gc;                                             \
+    USART0.CTRLB = USART_RXEN_bm | USART_TXEN_bm;                                  \
+  } while (0)
+#endif
 
 // Erase the page last written to the page buffer and write the buffer to it.
 static void __attribute__((noinline)) flash_page(void) {
@@ -103,6 +161,9 @@ struct state {
     uint8_t id, s, version, reason, flags;
     uint8_t image[2];                      // CRC of the image being received; FF FF if none
     uint8_t pages[(LAST_PAGE + 1) / 8];    // a bit per page written and read back right
+#if SF_BOARD == 5
+    uint8_t board;                         // 5 (the v4 build's reply ends at pages)
+#endif
   } status;
   uint8_t frame[FRAME_MAX];                // the frame just received
 };
@@ -224,6 +285,9 @@ static void __attribute__((noreturn)) update_mode(uint8_t reason) {
   SET_UP_UPDATE_MODE();
   st->status.s = 's';
   st->status.version = BL_VERSION;
+#if SF_BOARD == 5
+  st->status.board = SF_BOARD;
+#endif
   st->status.reason = reason;
   start_image(st, 0xFF, 0xFF);
   for (;;) {
